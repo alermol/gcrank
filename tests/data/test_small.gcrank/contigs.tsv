@@ -1,0 +1,8 @@
+chr_boundary_100	100	0
+chr_boundary_512	512	100
+chr_boundary_513	513	612
+chr_boundary_4096	4096	1125
+chr_boundary_4097	4097	5221
+chr_n_rich	1000	9318
+chr_mixed_case	777	10318
+chr_iupac_codes	300	11095

@@ -1,0 +1,17 @@
+# Build trees (any configuration, plus scratch benchmark/debug binaries)
+build/
+build-*/
+cmake-build-*/
+
+# Editor and OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Compiled objects that should never be committed next to the sources
+*.o
+*.a
+*.so
+*.dylib
+*.exe

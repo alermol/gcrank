@@ -1,0 +1,50 @@
+{
+  "builder_version": "1.0.0",
+  "created": "2023-11-14T22:13:20Z",
+  "files": {
+    "contigs.tsv": {
+      "crc32": "6a441a43",
+      "size": 201
+    },
+    "genome.bv": {
+      "crc32": "c27bd8aa",
+      "size": 1536
+    },
+    "genome.rb": {
+      "crc32": "0ec2c5c9",
+      "size": 80
+    },
+    "valid.bv": {
+      "crc32": "df148451",
+      "size": 1536
+    },
+    "valid.rb": {
+      "crc32": "7235a93f",
+      "size": 80
+    }
+  },
+  "format_version": "1.0.0",
+  "index": {
+    "basic_block_bits": 512,
+    "bit_order": "msb0",
+    "endianness": "little",
+    "remove_ambiguous_supported": true,
+    "superblock_bits": 4096
+  },
+  "semantics": {
+    "ambiguous_bases": "N, R, Y, S, W, K, M, B, D, H, V: never GC and never valid; removed from the denominator by gc_fraction(remove_ambiguous = true)",
+    "base_encoding": "genome.bv: 1 = unambiguous G/C; valid.bv: 1 = unambiguous A/C/G/T",
+    "gc_bases": "GC",
+    "remove_ambiguous": "when true the denominator is valid.bv (A+C+G+T), otherwise the window length",
+    "uracil": "U is the RNA spelling of T and is folded onto T: valid, never GC",
+    "valid_bases": "ACGT",
+    "window": "half-open [start, end), 0-based, over the concatenated contigs"
+  },
+  "source": {
+    "file_bytes": 11852,
+    "num_contigs": 8,
+    "path": "test_small.fa",
+    "sha256": "f8216f88bd2ae1530bf8ce573f4cf69598a941411f6bb982d2cd879c04ec031c",
+    "total_bases": 11395
+  }
+}
