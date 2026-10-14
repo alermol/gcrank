@@ -6,13 +6,17 @@ All notable changes to gcrank are recorded here. The format follows
 carries its own `format_version`, which is versioned independently of the
 package.
 
-## [Unreleased]
+## [2.0.0] - 2026-10-14
 
 ### Changed
 
-- The library and CLI now require C++23 (GCC 14+, Clang 18+ with libstdc++ 14+,
-  or MSVC 19.40+). The on-disk format, CLI output and query results are
-  unchanged; the golden-index byte-for-byte tests still pass.
+- **Breaking:** the library and CLI now require C++23 (GCC 14+, Clang 18+ with
+  libstdc++ 14+, or MSVC 19.40+). The on-disk format, CLI output and query
+  results are unchanged; the golden-index byte-for-byte tests still pass.
+- **Breaking:** source-level API changes: `BaseClass` is now a scoped enum,
+  `BitVector::append_bits` takes a `std::span<const uint64_t>`,
+  `GcRank::contig`, `Manifest::from_json` and `parse_major_version` take
+  `std::string_view`, and the query/metadata methods are `[[nodiscard]]`.
 - Modernized the internals with the C++20/23 standard library: `std::print`
   and `std::format` for diagnostics and canonical JSON, `std::span` for
   bitvector rank/word views and packed blocks, `<bit>` (`std::byteswap`,
@@ -21,8 +25,6 @@ package.
   compile time), `std::move_only_function` for thread-pool tasks,
   `std::jthread` with a stop token for the producer, `std::from_chars` for
   parsing and `std::format` for rendering, and range algorithms throughout.
-  `BaseClass` is now a scoped enum and `BitVector::append_bits` takes a
-  `std::span`.
 
 ## [1.0.0] - 2026-10-14
 

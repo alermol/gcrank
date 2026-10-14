@@ -80,7 +80,7 @@ int main() {
 Consume the installed package with CMake:
 
 ```cmake
-find_package(gcrank 1.0 REQUIRED)
+find_package(gcrank 2.0 REQUIRED)
 target_link_libraries(app PRIVATE gcrank::gcrank)
 ```
 

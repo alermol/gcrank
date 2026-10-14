@@ -47,7 +47,7 @@ namespace gcrank {
 // Version of the on-disk format (the public contract).
 inline constexpr const char* kFormatVersion = "1.0.0";
 // Version of the writer (library/builder); changes freely across releases.
-inline constexpr const char* kBuilderVersion = "1.0.0";
+inline constexpr const char* kBuilderVersion = "2.0.0";
 
 // ---- index layout --------------------------------------------------------
 

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(gcrank
-  VERSION 1.0.0
+  VERSION 2.0.0
   DESCRIPTION "Standalone C++23 library and CLI for O(1) GC-content queries"
   LANGUAGES CXX)
 

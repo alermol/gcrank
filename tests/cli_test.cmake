@@ -50,7 +50,7 @@ expect_matches(help "--overwrite")
 
 run_cli(version --version)
 expect_code(version 0)
-expect_matches(version "gcrank-build 1.0.0")
+expect_matches(version "gcrank-build 2.0.0")
 
 run_cli(noargs)
 expect_code(noargs 1)
