@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(gcrank
   VERSION 1.0.0
-  DESCRIPTION "Standalone C++17 library and CLI for O(1) GC-content queries"
+  DESCRIPTION "Standalone C++23 library and CLI for O(1) GC-content queries"
   LANGUAGES CXX)
 
 include(GNUInstallDirs)
@@ -12,7 +12,7 @@ option(GCRANK_BUILD_TESTS "Build the gcrank test suite" ON)
 option(GCRANK_BUILD_CLI "Build the gcrank-build command line tool" ON)
 option(GCRANK_TSAN "Build gcrank with ThreadSanitizer" OFF)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -41,7 +41,7 @@ add_library(gcrank
   src/thread_pool.cpp)
 add_library(gcrank::gcrank ALIAS gcrank)
 
-target_compile_features(gcrank PUBLIC cxx_std_17)
+target_compile_features(gcrank PUBLIC cxx_std_23)
 target_include_directories(gcrank PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
@@ -50,11 +50,6 @@ target_link_libraries(gcrank PRIVATE ZLIB::ZLIB Threads::Threads)
 set_target_properties(gcrank PROPERTIES
   VERSION ${PROJECT_VERSION}
   SOVERSION ${PROJECT_VERSION_MAJOR})
-
-# C++17 <filesystem> used to need an extra library on GCC < 9.
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.0)
-  target_link_libraries(gcrank PUBLIC stdc++fs)
-endif()
 
 if(GCRANK_TSAN)
   target_compile_options(gcrank PUBLIC -fsanitize=thread -g -O1)

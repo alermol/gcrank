@@ -1,13 +1,15 @@
 #include "gcrank/manifest.h"
 
 #include <algorithm>
-#include <cerrno>
-#include <cstdio>
+#include <charconv>
+#include <chrono>
 #include <cstdlib>
-#include <cstring>
 #include <ctime>
+#include <format>
 #include <fstream>
 #include <iterator>
+#include <limits>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -33,7 +35,7 @@ struct JsonValue {
   // Objects keep insertion order; the writer sorts for canonical output.
   std::vector<std::pair<std::string, JsonValue>> object;
 
-  const JsonValue* find(const std::string& key) const {
+  const JsonValue* find(std::string_view key) const {
     for (const auto& entry : object)
       if (entry.first == key) return &entry.second;
     return nullptr;
@@ -71,7 +73,7 @@ struct JsonValue {
 
 class JsonParser {
 public:
-  JsonParser(const std::string& text, std::string origin)
+  JsonParser(std::string_view text, std::string origin)
       : text_(text), origin_(std::move(origin)) {}
 
   JsonValue parse_document() {
@@ -108,10 +110,10 @@ private:
     ++pos_;
   }
 
-  void expect_literal(const char* literal) {
-    const std::size_t n = std::strlen(literal);
-    if (text_.compare(pos_, n, literal) != 0) fail(std::string("expected '") + literal + "'");
-    pos_ += n;
+  void expect_literal(std::string_view literal) {
+    if (text_.substr(pos_, literal.size()) != literal)
+      fail("expected '" + std::string(literal) + "'");
+    pos_ += literal.size();
   }
 
   JsonValue parse_value() {
@@ -200,7 +202,7 @@ private:
     unsigned value = 0;
     for (int i = 0; i < 4; ++i) {
       const char c = text_[pos_++];
-      unsigned digit;
+      unsigned digit = 0;
       if (c >= '0' && c <= '9')
         digit = static_cast<unsigned>(c - '0');
       else if (c >= 'a' && c <= 'f')
@@ -297,35 +299,40 @@ private:
       if (pos_ < text_.size() && (text_[pos_] == '+' || text_[pos_] == '-')) ++pos_;
       while (pos_ < text_.size() && text_[pos_] >= '0' && text_[pos_] <= '9') ++pos_;
     }
-    const std::string token = text_.substr(start, pos_ - start);
+    const std::string_view token = text_.substr(start, pos_ - start);
     JsonValue v;
     v.type = JsonValue::Type::Number;
+    const char* first = token.data();
+    const char* last = first + token.size();
     if (is_integer && token[0] != '-') {
-      errno = 0;
-      char* end = nullptr;
-      const unsigned long long value = std::strtoull(token.c_str(), &end, 10);
-      if (errno == 0 && end != nullptr && *end == '\0') {
+      uint64_t value = 0;
+      const std::from_chars_result parsed = std::from_chars(first, last, value);
+      if (parsed.ec == std::errc{} && parsed.ptr == last) {
         v.is_integer = true;
-        v.integer = static_cast<uint64_t>(value);
-      } else {
-        is_integer = false;
+        v.integer = value;
+        return v;
       }
+      is_integer = false;
     }
-    if (!is_integer) {
-      v.is_integer = false;
-      v.number = std::strtod(token.c_str(), nullptr);
-    }
+    double number = 0.0;
+    const std::from_chars_result parsed =
+        std::from_chars(first, last, number, std::chars_format::general);
+    if (parsed.ec == std::errc::result_out_of_range)
+      number = token.starts_with('-') ? -std::numeric_limits<double>::infinity()
+                                      : std::numeric_limits<double>::infinity();
+    v.is_integer = false;
+    v.number = number;
     return v;
   }
 
-  const std::string& text_;
+  const std::string_view text_;
   std::string origin_;
   std::size_t pos_ = 0;
 };
 
 // ---- writer --------------------------------------------------------------
 
-void write_json_string(const std::string& s, std::string& out) {
+void write_json_string(std::string_view s, std::string& out) {
   out.push_back('"');
   for (const char c : s) {
     const unsigned char u = static_cast<unsigned char>(c);
@@ -339,9 +346,7 @@ void write_json_string(const std::string& s, std::string& out) {
       case '\t': out += "\\t"; break;
       default:
         if (u < 0x20) {
-          char buf[8];
-          std::snprintf(buf, sizeof(buf), "\\u%04x", u);
-          out += buf;
+          std::format_to(std::back_inserter(out), "\\u{:04x}", u);
         } else {
           out.push_back(c);  // UTF-8 passes through
         }
@@ -364,9 +369,7 @@ void write_json(const JsonValue& value, std::string& out, int depth) {
       if (value.is_integer) {
         out += std::to_string(value.integer);
       } else {
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "%.17g", value.number);
-        out += buf;
+        std::format_to(std::back_inserter(out), "{:.17g}", value.number);
       }
       break;
     case JsonValue::Type::String:
@@ -395,9 +398,8 @@ void write_json(const JsonValue& value, std::string& out, int depth) {
       std::vector<const std::pair<std::string, JsonValue>*> entries;
       entries.reserve(value.object.size());
       for (const auto& entry : value.object) entries.push_back(&entry);
-      std::sort(entries.begin(), entries.end(),
-                [](const std::pair<std::string, JsonValue>* a,
-                   const std::pair<std::string, JsonValue>* b) { return a->first < b->first; });
+      std::ranges::sort(entries, std::less<>{},
+                        [](const auto* entry) -> const std::string& { return entry->first; });
       out += "{\n";
       for (std::size_t i = 0; i < entries.size(); ++i) {
         out += pad_inner;
@@ -415,84 +417,74 @@ void write_json(const JsonValue& value, std::string& out, int depth) {
 
 // ---- schema helpers ------------------------------------------------------
 
-const JsonValue& require_field(const JsonValue& object, const char* key, const std::string& ctx) {
+const JsonValue& require_field(const JsonValue& object, std::string_view key,
+                               const std::string& ctx) {
   if (object.type != JsonValue::Type::Object)
     throw FormatError(ctx + ": the top-level value must be a JSON object");
   const JsonValue* value = object.find(key);
-  if (value == nullptr) throw FormatError(ctx + ": missing required key '" + key + "'");
+  if (value == nullptr)
+    throw FormatError(ctx + ": missing required key '" + std::string(key) + "'");
   return *value;
 }
 
-std::string require_string(const JsonValue& object, const char* key, const std::string& ctx) {
+std::string require_string(const JsonValue& object, std::string_view key,
+                           const std::string& ctx) {
   const JsonValue& value = require_field(object, key, ctx);
   if (value.type != JsonValue::Type::String)
-    throw FormatError(ctx + ": key '" + key + "' must be a string");
+    throw FormatError(ctx + ": key '" + std::string(key) + "' must be a string");
   return value.text;
 }
 
-uint64_t require_uint(const JsonValue& object, const char* key, const std::string& ctx) {
+uint64_t require_uint(const JsonValue& object, std::string_view key, const std::string& ctx) {
   const JsonValue& value = require_field(object, key, ctx);
   if (value.type != JsonValue::Type::Number || !value.is_integer)
-    throw FormatError(ctx + ": key '" + key + "' must be a non-negative integer");
+    throw FormatError(ctx + ": key '" + std::string(key) +
+                      "' must be a non-negative integer");
   return value.integer;
 }
 
-const JsonValue& require_object(const JsonValue& object, const char* key, const std::string& ctx) {
+const JsonValue& require_object(const JsonValue& object, std::string_view key,
+                                const std::string& ctx) {
   const JsonValue& value = require_field(object, key, ctx);
   if (value.type != JsonValue::Type::Object)
-    throw FormatError(ctx + ": key '" + key + "' must be an object");
+    throw FormatError(ctx + ": key '" + std::string(key) + "' must be an object");
   return value;
 }
 
-bool require_bool(const JsonValue& object, const char* key, const std::string& ctx) {
+bool require_bool(const JsonValue& object, std::string_view key, const std::string& ctx) {
   const JsonValue& value = require_field(object, key, ctx);
   if (value.type != JsonValue::Type::Bool)
-    throw FormatError(ctx + ": key '" + key + "' must be a boolean");
+    throw FormatError(ctx + ": key '" + std::string(key) + "' must be a boolean");
   return value.boolean;
 }
 
-uint32_t parse_crc_hex(const std::string& text, const std::string& ctx) {
+uint32_t parse_crc_hex(std::string_view text, const std::string& ctx) {
   if (text.size() != 8) throw FormatError(ctx + ": crc32 must be 8 hex digits");
   uint32_t value = 0;
-  for (const char c : text) {
-    unsigned digit;
-    if (c >= '0' && c <= '9')
-      digit = static_cast<unsigned>(c - '0');
-    else if (c >= 'a' && c <= 'f')
-      digit = static_cast<unsigned>(c - 'a' + 10);
-    else if (c >= 'A' && c <= 'F')
-      digit = static_cast<unsigned>(c - 'A' + 10);
-    else
-      throw FormatError(ctx + ": crc32 contains a non-hex digit");
-    value = (value << 4) | digit;
-  }
+  const std::from_chars_result parsed =
+      std::from_chars(text.data(), text.data() + text.size(), value, 16);
+  if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size())
+    throw FormatError(ctx + ": crc32 contains a non-hex digit");
   return value;
 }
 
 }  // namespace
 
 std::string created_from_env() {
-  std::time_t when;
+  std::time_t when = std::time(nullptr);
   const char* env = std::getenv("SOURCE_DATE_EPOCH");
   if (env != nullptr && *env != '\0') {
-    errno = 0;
-    char* end = nullptr;
-    const long long value = std::strtoll(env, &end, 10);
-    if (errno != 0 || end == env || *end != '\0' || value < 0)
+    const std::string_view text(env);
+    long long value = 0;
+    const std::from_chars_result parsed =
+        std::from_chars(text.data(), text.data() + text.size(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() || value < 0)
       throw UsageError(std::string("SOURCE_DATE_EPOCH is not a valid epoch: '") + env + "'");
     when = static_cast<std::time_t>(value);
-  } else {
-    when = std::time(nullptr);
   }
-  std::tm tm = {};
-#if defined(_WIN32)
-  gmtime_s(&tm, &when);
-#else
-  gmtime_r(&when, &tm);
-#endif
-  char buf[32];
-  std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
-  return std::string(buf);
+  const auto seconds =
+      std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::from_time_t(when));
+  return std::format("{:%Y-%m-%dT%H:%M:%SZ}", seconds);
 }
 
 std::map<std::string, std::string> default_semantics() {
@@ -535,17 +527,17 @@ std::string Manifest::to_json() const {
   root.set("index", std::move(index_json));
 
   JsonValue files_json = JsonValue::make_object();
-  for (const auto& entry : files) {
-    JsonValue info = JsonValue::make_object();
-    info.set("size", JsonValue::make_uint(entry.second.size));
-    info.set("crc32", JsonValue::make_string(crc32_hex(entry.second.crc32)));
-    files_json.set(entry.first, std::move(info));
+  for (const auto& [name, info] : files) {
+    JsonValue entry = JsonValue::make_object();
+    entry.set("size", JsonValue::make_uint(info.size));
+    entry.set("crc32", JsonValue::make_string(crc32_hex(info.crc32)));
+    files_json.set(name, std::move(entry));
   }
   root.set("files", std::move(files_json));
 
   JsonValue semantics_json = JsonValue::make_object();
-  for (const auto& entry : semantics)
-    semantics_json.set(entry.first, JsonValue::make_string(entry.second));
+  for (const auto& [key, text] : semantics)
+    semantics_json.set(key, JsonValue::make_string(text));
   root.set("semantics", std::move(semantics_json));
 
   std::string out;
@@ -554,7 +546,7 @@ std::string Manifest::to_json() const {
   return out;
 }
 
-Manifest Manifest::from_json(const std::string& text, const std::string& origin) {
+Manifest Manifest::from_json(std::string_view text, const std::string& origin) {
   const JsonValue root = JsonParser(text, origin).parse_document();
   const std::string ctx = origin;
 
@@ -604,10 +596,10 @@ Manifest Manifest::from_json(const std::string& text, const std::string& origin)
   }
 
   const JsonValue& semantics = require_object(root, "semantics", ctx);
-  for (const auto& entry : semantics.object) {
-    if (entry.second.type != JsonValue::Type::String)
-      throw FormatError(ctx + ": semantics." + entry.first + " must be a string");
-    manifest.semantics[entry.first] = entry.second.text;
+  for (const auto& [key, value] : semantics.object) {
+    if (value.type != JsonValue::Type::String)
+      throw FormatError(ctx + ": semantics." + key + " must be a string");
+    manifest.semantics[key] = value.text;
   }
   for (const char* key : {"gc_bases", "valid_bases"})
     if (manifest.semantics.find(key) == manifest.semantics.end())

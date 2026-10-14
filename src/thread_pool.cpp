@@ -17,7 +17,7 @@ ThreadPool::~ThreadPool() {
   }
 }
 
-void ThreadPool::submit(std::function<void()> task) {
+void ThreadPool::submit(std::move_only_function<void()> task) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stopping_ || abort_) return;
@@ -28,7 +28,7 @@ void ThreadPool::submit(std::function<void()> task) {
 
 void ThreadPool::worker_loop() {
   for (;;) {
-    std::function<void()> task;
+    std::move_only_function<void()> task;
     {
       std::unique_lock<std::mutex> lock(mutex_);
       cv_task_.wait(lock, [this] { return !tasks_.empty() || stopping_ || abort_; });

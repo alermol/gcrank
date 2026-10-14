@@ -1,6 +1,6 @@
 # gcrank
 
-Standalone C++17 library and CLI that answer GC-content queries over a FASTA
+Standalone C++23 library and CLI that answer GC-content queries over a FASTA
 file (plain or gzip) in **O(1)** time, regardless of how large the window or
 the genome is: a 250 Mb chromosome costs the same as a single base — two rank
 lookups and a subtraction. Queries are answered from rank indices over two
@@ -10,7 +10,7 @@ handled without special cases.
 * **`gc_fraction()` is identical to `bedtools nuc`'s `pct_gc`** — same counts,
   same single-precision arithmetic, same printed digits; see
   [Comparison with `bedtools nuc`](#comparison-with-bedtools-nuc).
-* Library `libgcrank`: C++17, standard library + zlib only (CRC-32, SHA-256
+* Library `libgcrank`: C++23, standard library + zlib only (CRC-32, SHA-256
   and JSON are implemented in-tree); `main()` exists only in the CLI.
 * CLI `gcrank-build`: builds an index from a plain or gzip FASTA (format
   sniffed by magic bytes, never by extension).
@@ -18,8 +18,17 @@ handled without special cases.
   size**.
 * `mmap` loading, 64-bit offsets throughout, versioned and checksummed on-disk
   format.
-* **Tested on Linux** (GCC): Release, ASan+UBSan and ThreadSanitizer runs in
-  CI. The Windows and macOS code paths are untested.
+* **Tested on Linux** (GCC 14): Release, ASan+UBSan and ThreadSanitizer runs
+  in CI. The Windows and macOS code paths are untested.
+
+## Requirements
+
+* A C++23 compiler: GCC 14+, Clang 18+ (with libstdc++ 14+) or MSVC 19.40+
+  (Visual Studio 2022 17.10+). The build uses `std::print`, `std::format`,
+  `std::span`, `<bit>` (`std::byteswap`, `std::endian`, `std::popcount`,
+  `std::rotr`), `std::move_only_function`, `std::jthread`, `std::from_chars`
+  and the C++20/23 range algorithms.
+* CMake 3.20+ and zlib (the only third-party dependency).
 
 ## Quick start
 
@@ -217,7 +226,7 @@ invariance, and a committed golden index that is rebuilt and compared byte for
 byte. Reference values come from `data-raw/make_expected_gc.py`, which never
 calls gcrank; see `data-raw/README.md` for the regeneration policy.
 
-gcrank is **tested on Linux** (GCC). CI
+gcrank is **tested on Linux** (GCC 14). CI
 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the full suite in
 three configurations on every push and pull request: Release (static and
 shared), ASan + UBSan, and ThreadSanitizer. The Windows and macOS code paths

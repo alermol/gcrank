@@ -1,10 +1,18 @@
 #include "gcrank/line_reader.h"
 
 #include <cstring>
+#include <string_view>
 
 #include "gcrank/error.h"
 
 namespace gcrank {
+
+namespace {
+// Length of `text` without a trailing '\r', so CRLF input reads like LF.
+constexpr std::size_t without_cr(std::string_view text) {
+  return !text.empty() && text.back() == '\r' ? text.size() - 1 : text.size();
+}
+}  // namespace
 
 LineReader::LineReader(InputStream& in, std::size_t buffer_bytes) : in_(in) {
   if (buffer_bytes < 64) buffer_bytes = 64;
@@ -39,7 +47,7 @@ bool LineReader::next(const char** data, std::size_t* len) {
           line = scratch_.data();
           line_len = scratch_.size();
         }
-        if (line_len > 0 && line[line_len - 1] == '\r') --line_len;
+        line_len = without_cr(std::string_view(line, line_len));
         ++line_number_;
         *data = line_len > 0 ? line : nullptr;
         *len = line_len;
@@ -53,8 +61,7 @@ bool LineReader::next(const char** data, std::size_t* len) {
       if (!scratch_.empty()) {
         // Unterminated last line. The pointer must stay valid until the next
         // call, so scratch_ is not cleared here.
-        std::size_t line_len = scratch_.size();
-        if (line_len > 0 && scratch_[line_len - 1] == '\r') --line_len;
+        const std::size_t line_len = without_cr(scratch_);
         ++line_number_;
         *data = line_len > 0 ? scratch_.data() : nullptr;
         *len = line_len;

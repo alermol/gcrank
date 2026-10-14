@@ -14,13 +14,11 @@
 // vector), so rank1(pos) is defined for every pos in [0, size]. Rank support
 // costs ~4.7% of the bitvector's size.
 //
+#include <bit>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
-
-#if defined(_MSC_VER)
-#include <intrin.h>
-#endif
 
 #include "gcrank/error.h"
 #include "gcrank/format.h"
@@ -30,21 +28,11 @@ namespace gcrank {
 
 // Portable population count.
 inline int popcount64(uint64_t x) {
-#if defined(__GNUC__) || defined(__clang__)
-  return __builtin_popcountll(x);  // lowers to POPCNT when the target has it
-#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
-  return static_cast<int>(__popcnt64(x));
-#else
-  // SWAR fallback (portable; no intrinsics required).
-  x = x - ((x >> 1) & 0x5555555555555555ull);
-  x = (x & 0x3333333333333333ull) + ((x >> 2) & 0x3333333333333333ull);
-  x = (x + (x >> 4)) & 0x0f0f0f0f0f0f0f0full;
-  return static_cast<int>((x * 0x0101010101010101ull) >> 56);
-#endif
+  return std::popcount(x);  // lowers to POPCNT when the target has it
 }
 
 // Returns a mask with the top `n` bits set (n <= 64).
-inline uint64_t mask_high_bits(unsigned n) {
+inline constexpr uint64_t mask_high_bits(unsigned n) {
   if (n == 0) return 0;
   if (n >= 64) return ~uint64_t(0);
   return ~uint64_t(0) << (64 - n);
@@ -70,13 +58,13 @@ public:
 
   // Appends `nbits` bits from `src`, a packed block in the same MSB-first
   // order produced by the FASTA packer; padding bits after `nbits` in the last
-  // word must be zero.
-  void append_bits(const uint64_t* src, uint64_t nbits);
+  // word must be zero. `src` must hold at least ceil(nbits / 64) words.
+  void append_bits(std::span<const uint64_t> src, uint64_t nbits);
 
   // Builds the rank index over the current contents. Must be called after all
   // appends and before any rank1() query.
   void finalize();
-  bool has_rank() const { return sb_view_ != nullptr; }
+  bool has_rank() const { return !sb_view_.empty(); }
 
   // ---- access --------------------------------------------------------------
 
@@ -89,7 +77,7 @@ public:
   uint64_t rank1(uint64_t pos) const;
 
   // Raw word access (little-endian grouping); safe for i < num_words().
-  uint64_t word(uint64_t i) const { return words_data()[i]; }
+  uint64_t word(uint64_t i) const { return words_data()[static_cast<std::size_t>(i)]; }
 
   // ---- persistence ---------------------------------------------------------
 
@@ -114,21 +102,23 @@ public:
   bool is_mapped() const { return mapped_; }
 
 private:
-  const uint64_t* words_data() const { return words_view_ != nullptr ? words_view_ : words_.data(); }
+  std::span<const uint64_t> words_data() const {
+    return words_view_.empty() ? std::span<const uint64_t>(words_) : words_view_;
+  }
   void clear_rank();
   void bind_rank_views();
   void validate_rank_index(const std::string& path) const;
   static void read_file_exact(const std::string& path, std::vector<char>& out, uint64_t expect);
 
-  std::vector<uint64_t> words_;      // owned words (build / heap load)
-  const uint64_t* words_view_ = nullptr;  // mapped words
+  std::vector<uint64_t> words_;             // owned words (build / heap load)
+  std::span<const uint64_t> words_view_{};  // mapped words
   uint64_t num_words_ = 0;
-  uint64_t size_ = 0;                // logical bits, excluding padding
+  uint64_t size_ = 0;                       // logical bits, excluding padding
 
   std::vector<uint64_t> sb_owned_;
   std::vector<uint16_t> bb_owned_;
-  const uint64_t* sb_view_ = nullptr;
-  const uint16_t* bb_view_ = nullptr;
+  std::span<const uint64_t> sb_view_{};
+  std::span<const uint16_t> bb_view_{};
   uint64_t num_sb_ = 0;
   uint64_t num_bb_ = 0;
 

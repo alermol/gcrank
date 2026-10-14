@@ -144,7 +144,7 @@ TEST_CASE("bitvector: append_bits matches push_bit across misaligned blocks") {
     while (offset < length) {
       const uint64_t take = std::min<uint64_t>(1 + rng.next() % 200, length - offset);
       const std::vector<uint64_t> block = pack_slice(bits, offset, take);
-      bitvector.append_bits(block.data(), take);
+      bitvector.append_bits(block, take);
       offset += take;
     }
     CHECK(offset == length);
@@ -159,9 +159,16 @@ TEST_CASE("bitvector: append_bits matches push_bit across misaligned blocks") {
 TEST_CASE("bitvector: append_bits of zero bits is a no-op") {
   BitVector bitvector;
   bitvector.push_bit(true);
-  bitvector.append_bits(nullptr, 0);
+  bitvector.append_bits({}, 0);
   CHECK(bitvector.size() == 1);
   CHECK(bitvector.word(0) == 0x8000000000000000ull);
+}
+
+TEST_CASE("bitvector: append_bits rejects a source shorter than nbits") {
+  BitVector bitvector;
+  const std::vector<uint64_t> one_word{0};
+  CHECK_THROWS_AS(bitvector.append_bits(one_word, 65), UsageError);
+  CHECK(bitvector.size() == 0);
 }
 
 TEST_CASE("bitvector: padding bits stay zero") {
@@ -173,13 +180,13 @@ TEST_CASE("bitvector: padding bits stay zero") {
 
   BitVector appended;
   const std::vector<uint64_t> words = pack_slice(bits, 0, bits.size());
-  appended.append_bits(words.data(), bits.size());
+  appended.append_bits(words, bits.size());
   CHECK(tail_padding_is_zero(appended));
 
   BitVector halves;
-  halves.append_bits(words.data(), 64);
+  halves.append_bits(words, 64);
   const std::vector<uint64_t> rest = pack_slice(bits, 64, bits.size() - 64);
-  halves.append_bits(rest.data(), bits.size() - 64);
+  halves.append_bits(rest, bits.size() - 64);
   CHECK(tail_padding_is_zero(halves));
   CHECK(halves.size() == bits.size());
 

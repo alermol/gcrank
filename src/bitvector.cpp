@@ -1,6 +1,7 @@
 #include "gcrank/bitvector.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <fstream>
 
@@ -9,23 +10,25 @@
 namespace gcrank {
 
 namespace {
+// The format stores 64-bit words little-endian byte first, independent of the
+// host byte order.
 inline uint64_t load_le64(const uint8_t* p) {
-  return static_cast<uint64_t>(p[0]) | (static_cast<uint64_t>(p[1]) << 8) |
-         (static_cast<uint64_t>(p[2]) << 16) | (static_cast<uint64_t>(p[3]) << 24) |
-         (static_cast<uint64_t>(p[4]) << 32) | (static_cast<uint64_t>(p[5]) << 40) |
-         (static_cast<uint64_t>(p[6]) << 48) | (static_cast<uint64_t>(p[7]) << 56);
+  uint64_t v = 0;
+  std::memcpy(&v, p, sizeof(v));
+  if constexpr (std::endian::native == std::endian::big) v = std::byteswap(v);
+  return v;
 }
 inline void store_le64(uint8_t* p, uint64_t v) {
-  for (int i = 0; i < 8; ++i) p[i] = static_cast<uint8_t>(v >> (8 * i));
+  if constexpr (std::endian::native == std::endian::big) v = std::byteswap(v);
+  std::memcpy(p, &v, sizeof(v));
 }
-inline uint16_t bswap16(uint16_t v) { return static_cast<uint16_t>((v >> 8) | (v << 8)); }
 }  // namespace
 
 // ---- build -----------------------------------------------------------------
 
 void BitVector::clear() {
   words_.clear();
-  words_view_ = nullptr;
+  words_view_ = {};
   num_words_ = 0;
   size_ = 0;
   clear_rank();
@@ -36,19 +39,19 @@ void BitVector::clear() {
 void BitVector::clear_rank() {
   sb_owned_.clear();
   bb_owned_.clear();
-  sb_view_ = nullptr;
-  bb_view_ = nullptr;
+  sb_view_ = {};
+  bb_view_ = {};
   num_sb_ = 0;
   num_bb_ = 0;
 }
 
 void BitVector::bind_rank_views() {
-  sb_view_ = sb_owned_.empty() ? nullptr : sb_owned_.data();
-  bb_view_ = bb_owned_.empty() ? nullptr : bb_owned_.data();
+  sb_view_ = sb_owned_;
+  bb_view_ = bb_owned_;
 }
 
 void BitVector::push_bit(bool value) {
-  if (words_view_ != nullptr) throw Error("BitVector::push_bit on a mapped vector");
+  if (mapped_) throw Error("BitVector::push_bit on a mapped vector");
   if ((size_ & 63u) == 0) {
     words_.push_back(0);
     num_words_ = words_.size();
@@ -57,13 +60,16 @@ void BitVector::push_bit(bool value) {
   ++size_;
 }
 
-void BitVector::append_bits(const uint64_t* src, uint64_t nbits) {
+void BitVector::append_bits(std::span<const uint64_t> src, uint64_t nbits) {
   if (nbits == 0) return;
-  if (words_view_ != nullptr) throw Error("BitVector::append_bits on a mapped vector");
-  const uint64_t rem = size_ & 63u;
+  if (mapped_) throw Error("BitVector::append_bits on a mapped vector");
   const uint64_t nsrc = (nbits + 63) / 64;
+  if (src.size() < nsrc)
+    throw UsageError("BitVector::append_bits: source holds fewer than nbits bits");
+  const uint64_t rem = size_ & 63u;
   if (rem == 0) {
-    words_.insert(words_.end(), src, src + nsrc);
+    const std::span<const uint64_t> head = src.first(static_cast<std::size_t>(nsrc));
+    words_.insert(words_.end(), head.begin(), head.end());
     num_words_ = words_.size();
     size_ += nbits;
     return;
@@ -73,8 +79,8 @@ void BitVector::append_bits(const uint64_t* src, uint64_t nbits) {
   uint64_t carry = src[0] << shift;
   const uint64_t old_words = static_cast<uint64_t>(words_.size());
   for (uint64_t i = 1; i < nsrc; ++i) {
-    words_.push_back(carry | (src[i] >> rem));
-    carry = src[i] << shift;
+    words_.push_back(carry | (src[static_cast<std::size_t>(i)] >> rem));
+    carry = src[static_cast<std::size_t>(i)] << shift;
   }
   size_ += nbits;
   const uint64_t new_words = (size_ + 63) / 64;
@@ -85,9 +91,9 @@ void BitVector::append_bits(const uint64_t* src, uint64_t nbits) {
 void BitVector::finalize() {
   num_sb_ = rank_superblock_entries(size_);
   num_bb_ = rank_basic_block_entries(size_);
-  sb_owned_.assign(num_sb_, 0);
-  bb_owned_.assign(num_bb_, 0);
-  const uint64_t* w = words_data();
+  sb_owned_.assign(static_cast<std::size_t>(num_sb_), 0);
+  bb_owned_.assign(static_cast<std::size_t>(num_bb_), 0);
+  const std::span<const uint64_t> words = words_data();
   uint64_t total = 0;
   uint64_t next_sb = 0;
   uint64_t next_bb = 0;
@@ -95,44 +101,46 @@ void BitVector::finalize() {
     const uint64_t pos = i << 6;
     if ((pos & (kSuperblockBits - 1)) == 0) {
       const uint64_t b = pos >> 12;
-      while (next_sb <= b) sb_owned_[next_sb++] = total;
+      while (next_sb <= b) sb_owned_[static_cast<std::size_t>(next_sb++)] = total;
     }
     if ((pos & (kBasicBlockBits - 1)) == 0) {
       const uint64_t b = pos >> 9;
       const uint64_t base = sb_owned_[pos >> 12];
-      while (next_bb <= b) bb_owned_[next_bb++] = static_cast<uint16_t>(total - base);
+      while (next_bb <= b)
+        bb_owned_[static_cast<std::size_t>(next_bb++)] = static_cast<uint16_t>(total - base);
     }
-    total += static_cast<uint64_t>(popcount64(w[i]));
+    total += static_cast<uint64_t>(popcount64(words[static_cast<std::size_t>(i)]));
   }
-  while (next_sb <= num_sb_ - 1) sb_owned_[next_sb++] = total;
+  while (next_sb <= num_sb_ - 1) sb_owned_[static_cast<std::size_t>(next_sb++)] = total;
   while (next_bb <= num_bb_ - 1) {
     const uint64_t base = sb_owned_[(next_bb * kBasicBlockBits) >> 12];
-    bb_owned_[next_bb++] = static_cast<uint16_t>(total - base);
+    bb_owned_[static_cast<std::size_t>(next_bb++)] = static_cast<uint16_t>(total - base);
   }
   bind_rank_views();
 }
 
 bool BitVector::bit(uint64_t i) const {
   if (i >= size_) throw QueryError("BitVector::bit: index out of range");
-  return ((words_data()[i >> 6] >> (63 - (i & 63u))) & 1u) != 0;
+  return ((words_data()[static_cast<std::size_t>(i >> 6)] >> (63 - (i & 63u))) & 1u) != 0;
 }
 
 uint64_t BitVector::rank1(uint64_t pos) const {
-  if (sb_view_ == nullptr)
+  if (sb_view_.empty())
     throw Error("BitVector::rank1: rank index not built (call finalize() or load_rank())");
   if (pos > size_) throw QueryError("BitVector::rank1: position out of range");
   const uint64_t sb = pos >> 12;
   const uint64_t bb = pos >> 9;
-  uint64_t r = sb_view_[sb] + bb_view_[bb];
+  uint64_t r = sb_view_[static_cast<std::size_t>(sb)] + bb_view_[static_cast<std::size_t>(bb)];
   const unsigned bit_in_bb = static_cast<unsigned>(pos & (kBasicBlockBits - 1));
   const uint64_t base_word = bb * (kBasicBlockBits / 64);
   const uint64_t nwords = bit_in_bb >> 6;
-  const uint64_t* w = words_data();
+  const std::span<const uint64_t> words = words_data();
   for (uint64_t i = 0; i < nwords; ++i)
-    r += static_cast<uint64_t>(popcount64(w[base_word + i]));
+    r += static_cast<uint64_t>(popcount64(words[static_cast<std::size_t>(base_word + i)]));
   const unsigned tail = bit_in_bb & 63u;
   if (tail != 0)
-    r += static_cast<uint64_t>(popcount64(w[base_word + nwords] & mask_high_bits(tail)));
+    r += static_cast<uint64_t>(
+        popcount64(words[static_cast<std::size_t>(base_word + nwords)] & mask_high_bits(tail)));
   return r;
 }
 
@@ -144,12 +152,12 @@ BitVector& BitVector::operator=(const BitVector& other) {
   size_ = other.size_;
   num_words_ = other.num_words_;
   if (num_words_ > 0) {
-    const uint64_t* src = other.words_data();
-    words_.assign(src, src + num_words_);
+    const std::span<const uint64_t> src = other.words_data();
+    words_.assign(src.begin(), src.end());
   }
-  if (other.sb_view_ != nullptr) {
-    sb_owned_.assign(other.sb_view_, other.sb_view_ + other.num_sb_);
-    bb_owned_.assign(other.bb_view_, other.bb_view_ + other.num_bb_);
+  if (!other.sb_view_.empty()) {
+    sb_owned_.assign(other.sb_view_.begin(), other.sb_view_.end());
+    bb_owned_.assign(other.bb_view_.begin(), other.bb_view_.end());
     num_sb_ = other.num_sb_;
     num_bb_ = other.num_bb_;
     bind_rank_views();
@@ -182,18 +190,18 @@ FileInfo BitVector::save_bv(const std::string& path) const {
   if (!out) throw OutputError("cannot open '" + path + "' for writing");
   CRC32 crc;
   const bool le = host_is_little_endian();
-  const uint64_t* w = words_data();
-  const uint64_t kChunkWords = 8192;  // 64 KiB buffer
+  const std::span<const uint64_t> words = words_data();
+  constexpr uint64_t kChunkWords = 8192;  // 64 KiB buffer
   std::vector<uint8_t> buf(static_cast<std::size_t>(kChunkWords) * 8);
   for (uint64_t i = 0; i < total_words;) {
     const uint64_t chunk = std::min<uint64_t>(total_words - i, kChunkWords);
     const std::size_t bytes = static_cast<std::size_t>(chunk) * 8;
     if (le && i + chunk <= num_words_) {
-      std::memcpy(buf.data(), w + i, bytes);
+      std::memcpy(buf.data(), words.data() + static_cast<std::size_t>(i), bytes);
     } else {
       uint8_t* p = buf.data();
       for (uint64_t j = 0; j < chunk; ++j, p += 8)
-        store_le64(p, (i + j) < num_words_ ? w[i + j] : 0);
+        store_le64(p, (i + j) < num_words_ ? words[static_cast<std::size_t>(i + j)] : 0);
     }
     out.write(reinterpret_cast<const char*>(buf.data()), static_cast<std::streamsize>(bytes));
     if (!out) throw OutputError("write error on '" + path + "'");
@@ -206,17 +214,17 @@ FileInfo BitVector::save_bv(const std::string& path) const {
 }
 
 FileInfo BitVector::save_rank(const std::string& path) const {
-  if (sb_view_ == nullptr)
+  if (sb_view_.empty())
     throw Error("BitVector::save_rank: no rank index (call finalize())");
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
   if (!out) throw OutputError("cannot open '" + path + "' for writing");
   CRC32 crc;
   // Scalars are written in host byte order; the manifest records which one.
-  const std::size_t sb_bytes = static_cast<std::size_t>(num_sb_) * sizeof(uint64_t);
-  const std::size_t bb_bytes = static_cast<std::size_t>(num_bb_) * sizeof(uint16_t);
+  const std::size_t sb_bytes = sb_view_.size() * sizeof(uint64_t);
+  const std::size_t bb_bytes = bb_view_.size() * sizeof(uint16_t);
   std::vector<uint8_t> buf(sb_bytes + bb_bytes);
-  std::memcpy(buf.data(), sb_view_, sb_bytes);
-  std::memcpy(buf.data() + sb_bytes, bb_view_, bb_bytes);
+  std::memcpy(buf.data(), sb_view_.data(), sb_bytes);
+  std::memcpy(buf.data() + sb_bytes, bb_view_.data(), bb_bytes);
   out.write(reinterpret_cast<const char*>(buf.data()),
             static_cast<std::streamsize>(buf.size()));
   out.flush();
@@ -229,7 +237,7 @@ void BitVector::load_bv(const std::string& path, uint64_t nbits) {
   const uint64_t expect = bv_bytes(nbits);
   std::vector<char> raw;
   read_file_exact(path, raw, expect);
-  words_view_ = nullptr;
+  words_view_ = {};
   maps_.clear();
   mapped_ = false;
   size_ = nbits;
@@ -239,7 +247,8 @@ void BitVector::load_bv(const std::string& path, uint64_t nbits) {
     if (expect > 0) std::memcpy(words_.data(), raw.data(), static_cast<std::size_t>(expect));
   } else {
     const uint8_t* p = reinterpret_cast<const uint8_t*>(raw.data());
-    for (uint64_t i = 0; i < num_words_; ++i) words_[i] = load_le64(p + 8 * i);
+    for (uint64_t i = 0; i < num_words_; ++i)
+      words_[static_cast<std::size_t>(i)] = load_le64(p + 8 * i);
   }
 }
 
@@ -257,24 +266,13 @@ void BitVector::load_rank(const std::string& path, uint64_t nbits, bool stored_l
   bb_owned_.resize(static_cast<std::size_t>(nbb));
   for (uint64_t i = 0; i < nsb; ++i) {
     uint64_t v = 0;
-    std::memcpy(&v, base + 8 * i, 8);
-    sb_owned_[i] = v;
+    std::memcpy(&v, base + 8 * i, sizeof(v));
+    sb_owned_[static_cast<std::size_t>(i)] = swap ? std::byteswap(v) : v;
   }
   for (uint64_t j = 0; j < nbb; ++j) {
     uint16_t v = 0;
-    std::memcpy(&v, base + 8 * nsb + 2 * j, 2);
-    bb_owned_[j] = v;
-  }
-  if (swap) {
-    for (uint64_t i = 0; i < nsb; ++i) {
-      uint64_t v = sb_owned_[i];
-      v = ((v & 0x00000000000000FFull) << 56) | ((v & 0x000000000000FF00ull) << 40) |
-          ((v & 0x0000000000FF0000ull) << 24) | ((v & 0x00000000FF000000ull) << 8) |
-          ((v & 0x000000FF00000000ull) >> 8) | ((v & 0x0000FF0000000000ull) >> 24) |
-          ((v & 0x00FF000000000000ull) >> 40) | ((v & 0xFF00000000000000ull) >> 56);
-      sb_owned_[i] = v;
-    }
-    for (uint64_t j = 0; j < nbb; ++j) bb_owned_[j] = bswap16(bb_owned_[j]);
+    std::memcpy(&v, base + 8 * nsb + 2 * j, sizeof(v));
+    bb_owned_[static_cast<std::size_t>(j)] = swap ? std::byteswap(v) : v;
   }
   bind_rank_views();
   validate_rank_index(path);
@@ -285,16 +283,18 @@ void BitVector::map_bv(MappedFile file, uint64_t nbits) {
   if (file.size() != expect)
     throw FormatError("'" + file.name() + "': mapped size " + std::to_string(file.size()) +
                       " does not match the expected " + std::to_string(expect) + " bytes");
-  words_view_ = nullptr;
+  words_view_ = {};
   words_.clear();
   size_ = nbits;
   num_words_ = expect / 8;
   if (host_is_little_endian() && file.data() != nullptr) {
-    words_view_ = reinterpret_cast<const uint64_t*>(file.data());
+    words_view_ = std::span<const uint64_t>(
+        reinterpret_cast<const uint64_t*>(file.data()), static_cast<std::size_t>(num_words_));
   } else if (num_words_ > 0) {
     words_.assign(static_cast<std::size_t>(num_words_), 0);
     const uint8_t* p = file.data();
-    for (uint64_t i = 0; i < num_words_; ++i) words_[i] = load_le64(p + 8 * i);
+    for (uint64_t i = 0; i < num_words_; ++i)
+      words_[static_cast<std::size_t>(i)] = load_le64(p + 8 * i);
   }
   maps_.push_back(std::move(file));
   mapped_ = true;
@@ -311,8 +311,10 @@ void BitVector::map_rank(MappedFile file, uint64_t nbits, bool stored_little_end
   num_sb_ = nsb;
   num_bb_ = nbb;
   if (stored_little_endian == host_is_little_endian()) {
-    sb_view_ = reinterpret_cast<const uint64_t*>(file.data());
-    bb_view_ = reinterpret_cast<const uint16_t*>(file.data() + nsb * 8);
+    sb_view_ = std::span<const uint64_t>(reinterpret_cast<const uint64_t*>(file.data()),
+                                         static_cast<std::size_t>(nsb));
+    bb_view_ = std::span<const uint16_t>(
+        reinterpret_cast<const uint16_t*>(file.data() + nsb * 8), static_cast<std::size_t>(nbb));
   } else {
     // Byte order differs: materialize swapped copies.
     const uint8_t* base = file.data();
@@ -320,17 +322,13 @@ void BitVector::map_rank(MappedFile file, uint64_t nbits, bool stored_little_end
     bb_owned_.resize(static_cast<std::size_t>(nbb));
     for (uint64_t i = 0; i < nsb; ++i) {
       uint64_t v = 0;
-      std::memcpy(&v, base + 8 * i, 8);
-      v = ((v & 0x00000000000000FFull) << 56) | ((v & 0x000000000000FF00ull) << 40) |
-          ((v & 0x0000000000FF0000ull) << 24) | ((v & 0x00000000FF000000ull) << 8) |
-          ((v & 0x000000FF00000000ull) >> 8) | ((v & 0x0000FF0000000000ull) >> 24) |
-          ((v & 0x00FF000000000000ull) >> 40) | ((v & 0xFF00000000000000ull) >> 56);
-      sb_owned_[i] = v;
+      std::memcpy(&v, base + 8 * i, sizeof(v));
+      sb_owned_[static_cast<std::size_t>(i)] = std::byteswap(v);
     }
     for (uint64_t j = 0; j < nbb; ++j) {
       uint16_t v = 0;
-      std::memcpy(&v, base + 8 * nsb + 2 * j, 2);
-      bb_owned_[j] = bswap16(v);
+      std::memcpy(&v, base + 8 * nsb + 2 * j, sizeof(v));
+      bb_owned_[static_cast<std::size_t>(j)] = std::byteswap(v);
     }
     bind_rank_views();
   }
@@ -341,13 +339,13 @@ void BitVector::map_rank(MappedFile file, uint64_t nbits, bool stored_little_end
 
 void BitVector::validate_rank_index(const std::string& path) const {
   uint64_t prev = 0;
-  for (uint64_t i = 0; i < num_sb_; ++i) {
-    if (sb_view_[i] < prev)
+  for (const uint64_t rank : sb_view_) {
+    if (rank < prev)
       throw FormatError("'" + path + "': rank index is not monotonic");
-    prev = sb_view_[i];
+    prev = rank;
   }
-  for (uint64_t j = 0; j < num_bb_; ++j) {
-    if (bb_view_[j] > kSuperblockBits)
+  for (const uint16_t rank : bb_view_) {
+    if (rank > kSuperblockBits)
       throw FormatError("'" + path + "': basic-block rank entry out of range");
   }
 }

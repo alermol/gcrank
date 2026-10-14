@@ -30,8 +30,13 @@
 // The extra trailing entry of each array is the rank at the end of the vector,
 // so rank1(pos) is defined for every pos in [0, nbits].
 //
+#include <array>
+#include <bit>
+#include <charconv>
 #include <cstdint>
 #include <string>
+#include <string_view>
+#include <system_error>
 
 #include "gcrank/error.h"
 
@@ -100,15 +105,8 @@ struct FileInfo {
 // ---- host properties -----------------------------------------------------
 
 // True when the host stores multi-byte integers least significant byte first.
-inline bool host_is_little_endian() {
-#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
-  return __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__;
-#elif defined(_WIN32)
-  return true;  // every Windows target supported by gcrank is little-endian
-#else
-  const uint16_t probe = 1;
-  return *reinterpret_cast<const uint8_t*>(&probe) == 1;
-#endif
+inline constexpr bool host_is_little_endian() {
+  return std::endian::native == std::endian::little;
 }
 
 inline const char* host_endianness_name() {
@@ -143,15 +141,18 @@ inline const char* host_endianness_name() {
 // Whitespace inside sequence lines is ignored; any other byte (including gaps
 // such as '-', '.' and '*') is an InputError.
 
-enum BaseClass : uint8_t {
-  kBaseInvalid = 0,
-  kBaseA = 1,
-  kBaseC = 2,
-  kBaseG = 3,
-  kBaseT = 4,
-  kBaseAmbiguous = 5,  // N and the IUPAC ambiguity codes
-  kBaseWhitespace = 6,
+enum class BaseClass : uint8_t {
+  Invalid = 0,
+  A = 1,
+  C = 2,
+  G = 3,
+  T = 4,
+  Ambiguous = 5,  // N and the IUPAC ambiguity codes
+  Whitespace = 6,
 };
+
+// Whitespace bytes skipped inside sequence lines and header lines.
+inline constexpr std::string_view kWhitespaceBytes = " \t\v\f\r";
 
 // The IUPAC ambiguity codes and N; upper case (the lower case letters are
 // mapped to the same class).
@@ -159,28 +160,28 @@ inline constexpr const char* kAmbiguousBasesUpper = "NRYSWKMBDHV";
 inline constexpr const char* kAmbiguousBasesLower = "nryswkmbdhv";
 
 struct BaseTable {
-  uint8_t v[256] = {};
+  std::array<BaseClass, 256> v{};
   constexpr BaseTable() {
-    v[static_cast<unsigned>('A')] = kBaseA;
-    v[static_cast<unsigned>('C')] = kBaseC;
-    v[static_cast<unsigned>('G')] = kBaseG;
-    v[static_cast<unsigned>('T')] = kBaseT;
-    v[static_cast<unsigned>('a')] = kBaseA;
-    v[static_cast<unsigned>('c')] = kBaseC;
-    v[static_cast<unsigned>('g')] = kBaseG;
-    v[static_cast<unsigned>('t')] = kBaseT;
+    v[static_cast<unsigned>('A')] = BaseClass::A;
+    v[static_cast<unsigned>('C')] = BaseClass::C;
+    v[static_cast<unsigned>('G')] = BaseClass::G;
+    v[static_cast<unsigned>('T')] = BaseClass::T;
+    v[static_cast<unsigned>('a')] = BaseClass::A;
+    v[static_cast<unsigned>('c')] = BaseClass::C;
+    v[static_cast<unsigned>('g')] = BaseClass::G;
+    v[static_cast<unsigned>('t')] = BaseClass::T;
     // Uracil is the RNA spelling of thymine.
-    v[static_cast<unsigned>('U')] = kBaseT;
-    v[static_cast<unsigned>('u')] = kBaseT;
+    v[static_cast<unsigned>('U')] = BaseClass::T;
+    v[static_cast<unsigned>('u')] = BaseClass::T;
     for (int i = 0; kAmbiguousBasesUpper[i] != '\0'; ++i)
-      v[static_cast<unsigned char>(kAmbiguousBasesUpper[i])] = kBaseAmbiguous;
+      v[static_cast<unsigned char>(kAmbiguousBasesUpper[i])] = BaseClass::Ambiguous;
     for (int i = 0; kAmbiguousBasesLower[i] != '\0'; ++i)
-      v[static_cast<unsigned char>(kAmbiguousBasesLower[i])] = kBaseAmbiguous;
-    v[static_cast<unsigned>(' ')] = kBaseWhitespace;
-    v[static_cast<unsigned>('\t')] = kBaseWhitespace;
-    v[static_cast<unsigned>('\v')] = kBaseWhitespace;
-    v[static_cast<unsigned>('\f')] = kBaseWhitespace;
-    v[static_cast<unsigned>('\r')] = kBaseWhitespace;
+      v[static_cast<unsigned char>(kAmbiguousBasesLower[i])] = BaseClass::Ambiguous;
+    v[static_cast<unsigned>(' ')] = BaseClass::Whitespace;
+    v[static_cast<unsigned>('\t')] = BaseClass::Whitespace;
+    v[static_cast<unsigned>('\v')] = BaseClass::Whitespace;
+    v[static_cast<unsigned>('\f')] = BaseClass::Whitespace;
+    v[static_cast<unsigned>('\r')] = BaseClass::Whitespace;
   }
 };
 
@@ -189,53 +190,51 @@ inline constexpr BaseTable kBaseTable{};
 // Upper-case normalization of accepted sequence bytes, with U (uracil) folded
 // onto T. Applied to every base the parser hands out.
 struct UpperTable {
-  uint8_t v[256] = {};
+  std::array<char, 256> v{};
   constexpr UpperTable() {
-    for (int c = 0; c < 256; ++c) v[c] = static_cast<uint8_t>(c);
-    for (int c = 'a'; c <= 'z'; ++c) v[c] = static_cast<uint8_t>(c - 32);
-    v[static_cast<unsigned>('U')] = static_cast<uint8_t>('T');
-    v[static_cast<unsigned>('u')] = static_cast<uint8_t>('T');
+    for (int c = 0; c < 256; ++c) v[static_cast<std::size_t>(c)] = static_cast<char>(c);
+    for (int c = 'a'; c <= 'z'; ++c)
+      v[static_cast<std::size_t>(c)] = static_cast<char>(c - 32);
+    v[static_cast<unsigned>('U')] = 'T';
+    v[static_cast<unsigned>('u')] = 'T';
   }
 };
 
 inline constexpr UpperTable kUpperTable{};
 
 // Classification lookup for one byte of sequence data.
-inline constexpr uint8_t base_class(char c) {
+inline constexpr BaseClass base_class(char c) {
   return kBaseTable.v[static_cast<unsigned char>(c)];
 }
 // Upper-case (and U -> T) normalization for the parsed sequence.
 inline constexpr char normalized_base(char c) {
-  return static_cast<char>(kUpperTable.v[static_cast<unsigned char>(c)]);
+  return kUpperTable.v[static_cast<unsigned char>(c)];
 }
 // True for an unambiguous G/C (the genome.bv bit).
-inline constexpr bool base_is_gc(uint8_t cls) {
-  return cls == kBaseG || cls == kBaseC;
+inline constexpr bool base_is_gc(BaseClass cls) {
+  return cls == BaseClass::G || cls == BaseClass::C;
 }
 // True for an unambiguous A/C/G/T/U (the valid.bv bit).
-inline constexpr bool base_is_valid(uint8_t cls) {
-  return cls >= kBaseA && cls <= kBaseT;
+inline constexpr bool base_is_valid(BaseClass cls) {
+  return cls >= BaseClass::A && cls <= BaseClass::T;
 }
 // True for N and the IUPAC ambiguity codes.
-inline constexpr bool base_is_ambiguous(uint8_t cls) { return cls == kBaseAmbiguous; }
+inline constexpr bool base_is_ambiguous(BaseClass cls) { return cls == BaseClass::Ambiguous; }
 
 // ---- version parsing -----------------------------------------------------
 
 // Returns the major version of a "MAJOR.MINOR.PATCH" string.
 // Throws FormatError when the string is not a version number.
-inline int parse_major_version(const std::string& version) {
-  std::size_t i = 0;
-  if (i >= version.size() || version[i] < '0' || version[i] > '9')
-    throw FormatError("malformed version string '" + version + "'");
-  long major = 0;
-  while (i < version.size() && version[i] >= '0' && version[i] <= '9') {
-    major = major * 10 + (version[i] - '0');
-    if (major > 1000000) throw FormatError("malformed version string '" + version + "'");
-    ++i;
+inline int parse_major_version(std::string_view version) {
+  int major = 0;
+  const char* first = version.data();
+  const char* last = first + version.size();
+  const std::from_chars_result parsed = std::from_chars(first, last, major);
+  if (parsed.ec != std::errc{} || parsed.ptr == first || parsed.ptr == last ||
+      *parsed.ptr != '.' || major < 0 || major > 1000000) {
+    throw FormatError("malformed version string '" + std::string(version) + "'");
   }
-  if (i >= version.size() || version[i] != '.')
-    throw FormatError("malformed version string '" + version + "'");
-  return static_cast<int>(major);
+  return major;
 }
 
 }  // namespace gcrank

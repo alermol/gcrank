@@ -2,13 +2,19 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
 #include <filesystem>
+#include <format>
 #include <fstream>
+#include <iterator>
 #include <mutex>
+#include <print>
+#include <span>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -57,7 +63,7 @@ struct Slot {
 
 // Packs bases into MSB-first 64-bit words (bit 0 of the block = MSB of word 0).
 // Padding bits after `n` bases in the last word are zero.
-void pack_block(const std::vector<char>& bases, std::vector<uint64_t>& gc_words,
+void pack_block(std::span<const char> bases, std::vector<uint64_t>& gc_words,
                 std::vector<uint64_t>& valid_words) {
   const std::size_t n = bases.size();
   const std::size_t nwords = (n + 63) / 64;
@@ -67,7 +73,7 @@ void pack_block(const std::vector<char>& bases, std::vector<uint64_t>& gc_words,
   uint64_t gc_acc = 0;
   uint64_t valid_acc = 0;
   for (std::size_t i = 0; i < n; ++i) {
-    const uint8_t cls = base_class(bases[i]);
+    const BaseClass cls = base_class(bases[i]);
     gc_acc = (gc_acc << 1) | (base_is_gc(cls) ? uint64_t(1) : uint64_t(0));
     valid_acc = (valid_acc << 1) | (base_is_valid(cls) ? uint64_t(1) : uint64_t(0));
     if ((i & 63u) == 63u) {
@@ -103,7 +109,7 @@ public:
     genome_ = &genome;
     valid_ = &valid;
     contigs_ = &contigs;
-    producer_ = std::thread([this] { produce(); });
+    producer_ = std::jthread([this](std::stop_token stop) { produce(stop); });
     for (unsigned i = 0; i < workers_; ++i) pool_.submit([this] { work_loop(); });
     try {
       assemble();
@@ -117,7 +123,7 @@ public:
 private:
   // ---- producer ----------------------------------------------------------
 
-  void produce() {
+  void produce(std::stop_token stop) {
     try {
       std::unique_ptr<FastaReader> reader = FastaReader::from_path(path_, chunk_);
       uint64_t index = 0;
@@ -130,8 +136,10 @@ private:
         Slot& slot = slots_[static_cast<std::size_t>(index % capacity_)];
         {
           std::unique_lock<std::mutex> lock(mutex_);
-          cv_free_.wait(lock, [&] { return slot.free || failed_.load() || abort_; });
-          if (failed_.load() || abort_) throw PipelineAbort{};
+          cv_free_.wait(lock, [&] {
+            return slot.free || failed_.load() || stop.stop_requested();
+          });
+          if (failed_.load() || stop.stop_requested()) throw PipelineAbort{};
           slot.free = false;
         }
 
@@ -163,16 +171,14 @@ private:
           if (now >= next_progress) {
             next_progress = now + std::chrono::seconds(4);
             std::lock_guard<std::mutex> log(verbose_mutex_);
-            std::fprintf(stderr, "[gcrank] parsed %llu bases\r",
-                         static_cast<unsigned long long>(bases));
+            std::print(stderr, "[gcrank] parsed {} bases\r", bases);
             std::fflush(stderr);
           }
         }
       }
       if (verbose_) {
         std::lock_guard<std::mutex> log(verbose_mutex_);
-        std::fprintf(stderr, "[gcrank] parsed %llu bases\n",
-                     static_cast<unsigned long long>(bases));
+        std::print(stderr, "[gcrank] parsed {} bases\n", bases);
         std::fflush(stderr);
       }
     } catch (const PipelineAbort&) {
@@ -277,8 +283,8 @@ private:
           current.offset = genome_->size();
           break;
         case Slot::Kind::Block:
-          genome_->append_bits(slot.gc_words.data(), slot.nbases);
-          valid_->append_bits(slot.valid_words.data(), slot.nbases);
+          genome_->append_bits(slot.gc_words, slot.nbases);
+          valid_->append_bits(slot.valid_words, slot.nbases);
           current.length += slot.nbases;
           break;
         case Slot::Kind::ContigEnd:
@@ -296,15 +302,12 @@ private:
   }
 
   void shutdown() {
+    producer_.request_stop();
     {
       std::lock_guard<std::mutex> lock(queue_mutex_);
       workers_stop_ = true;
     }
     cv_work_.notify_all();
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      abort_ = true;
-    }
     cv_free_.notify_all();
     cv_ready_.notify_all();
     if (producer_.joinable()) producer_.join();
@@ -329,7 +332,6 @@ private:
   uint64_t produce_index_ = 0;
   uint64_t consume_index_ = 0;
   bool producer_done_ = false;
-  bool abort_ = false;
   std::exception_ptr producer_error_;
   std::exception_ptr worker_error_;
   std::atomic<bool> failed_{false};
@@ -340,7 +342,7 @@ private:
   bool workers_stop_ = false;
 
   std::mutex verbose_mutex_;
-  std::thread producer_;
+  std::jthread producer_;
   ThreadPool pool_;
 
   BitVector* genome_ = nullptr;
@@ -360,12 +362,8 @@ FileInfo write_contigs(const fs::path& path, const std::vector<ContigInfo>& cont
     if (contig.name.find('\n') != std::string::npos)
       throw Error("contig name contains a newline; refusing to write '" + path.string() + "'");
     line.clear();
-    line += contig.name;
-    line += '\t';
-    line += std::to_string(contig.length);
-    line += '\t';
-    line += std::to_string(contig.offset);
-    line += '\n';
+    std::format_to(std::back_inserter(line), "{}\t{}\t{}\n", contig.name, contig.length,
+                   contig.offset);
     out.write(line.data(), static_cast<std::streamsize>(line.size()));
     if (!out) throw OutputError("write error on '" + path.string() + "'");
     crc.update(line.data(), line.size());
@@ -376,17 +374,17 @@ FileInfo write_contigs(const fs::path& path, const std::vector<ContigInfo>& cont
   return FileInfo{bytes, crc.value()};
 }
 
-uint64_t parse_u64_field(const std::string& text, const std::string& path, const char* what) {
-  if (text.empty()) throw FormatError("'" + path + "': empty " + what);
+uint64_t parse_u64_field(std::string_view text, const std::string& path, std::string_view what) {
+  if (text.empty()) throw FormatError("'" + path + "': empty " + std::string(what));
   uint64_t value = 0;
-  for (const char c : text) {
-    if (c < '0' || c > '9')
-      throw FormatError("'" + path + "': " + what + " is not a number: '" + text + "'");
-    const uint64_t digit = static_cast<uint64_t>(c - '0');
-    if (value > (UINT64_MAX - digit) / 10)
-      throw FormatError("'" + path + "': " + what + " overflows: '" + text + "'");
-    value = value * 10 + digit;
-  }
+  const std::from_chars_result parsed =
+      std::from_chars(text.data(), text.data() + text.size(), value);
+  if (parsed.ec == std::errc::result_out_of_range)
+    throw FormatError("'" + path + "': " + std::string(what) + " overflows: '" +
+                      std::string(text) + "'");
+  if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size())
+    throw FormatError("'" + path + "': " + std::string(what) + " is not a number: '" +
+                      std::string(text) + "'");
   return value;
 }
 
@@ -399,19 +397,20 @@ std::vector<ContigInfo> parse_contigs(const fs::path& path, uint64_t expected_co
   std::string line;
   uint64_t next_offset = 0;
   while (std::getline(in, line)) {
-    if (!line.empty() && line.back() == '\r') line.pop_back();
-    if (line.empty()) continue;
-    const std::size_t tab_offset = line.rfind('\t');
-    if (tab_offset == std::string::npos)
+    std::string_view view(line);
+    if (!view.empty() && view.back() == '\r') view.remove_suffix(1);
+    if (view.empty()) continue;
+    const std::size_t tab_offset = view.rfind('\t');
+    if (tab_offset == std::string_view::npos)
       throw FormatError("'" + name + "': expected '<name>\\t<length>\\t<offset>'");
-    const std::size_t tab_length = line.rfind('\t', tab_offset - 1);
-    if (tab_length == std::string::npos)
+    const std::size_t tab_length = view.rfind('\t', tab_offset - 1);
+    if (tab_length == std::string_view::npos)
       throw FormatError("'" + name + "': expected '<name>\\t<length>\\t<offset>'");
     ContigInfo contig;
-    contig.name = line.substr(0, tab_length);
-    contig.length = parse_u64_field(line.substr(tab_length + 1, tab_offset - tab_length - 1),
+    contig.name = view.substr(0, tab_length);
+    contig.length = parse_u64_field(view.substr(tab_length + 1, tab_offset - tab_length - 1),
                                     name, "contig length");
-    contig.offset = parse_u64_field(line.substr(tab_offset + 1), name, "contig offset");
+    contig.offset = parse_u64_field(view.substr(tab_offset + 1), name, "contig offset");
     if (contig.offset != next_offset)
       throw FormatError("'" + name + "': contig '" + contig.name + "' starts at " +
                         std::to_string(contig.offset) + " but " +
@@ -474,7 +473,7 @@ void load_bitvector(BitVector& bitvector, const fs::path& bv_path, const fs::pat
       bitvector.map_rank(std::move(rb_file), nbits, stored_little_endian);
       return;
     } catch (const IoError& error) {
-      std::fprintf(stderr, "gcrank: warning: %s; falling back to reading\n", error.what());
+      std::print(stderr, "gcrank: warning: {}; falling back to reading\n", error.what());
     }
   }
   bitvector.load_bv(bv_path.string(), nbits);
@@ -514,11 +513,10 @@ void GcRank::build(const std::string& fasta_path, const BuildOptions& options) {
 
   const auto started = std::chrono::steady_clock::now();
   if (options.verbose)
-    std::fprintf(stderr,
-                 "[gcrank] building from %s (%llu bytes) with %u worker thread(s), "
-                 "chunk %llu bases\n",
-                 fasta_path.c_str(), static_cast<unsigned long long>(file_bytes), workers,
-                 static_cast<unsigned long long>(options.chunk_bits));
+    std::print(stderr,
+               "[gcrank] building from {} ({} bytes) with {} worker thread(s), "
+               "chunk {} bases\n",
+               fasta_path, file_bytes, workers, options.chunk_bits);
 
   BuildPipeline pipeline(fasta_path, options.chunk_bits, workers, options.verbose);
   pipeline.run(genome_, valid_, contigs_);
@@ -545,11 +543,9 @@ void GcRank::build(const std::string& fasta_path, const BuildOptions& options) {
   if (options.verbose) {
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-    std::fprintf(stderr,
-                 "[gcrank] built %llu bases, %llu contigs, %llu GC in %.2fs\n",
-                 static_cast<unsigned long long>(manifest_.source.total_bases),
-                 static_cast<unsigned long long>(manifest_.source.num_contigs),
-                 static_cast<unsigned long long>(genome_.rank1(genome_.size())), seconds);
+    std::print(stderr, "[gcrank] built {} bases, {} contigs, {} GC in {:.2f}s\n",
+               manifest_.source.total_bases, manifest_.source.num_contigs,
+               genome_.rank1(genome_.size()), seconds);
   }
 }
 
@@ -683,10 +679,12 @@ const std::vector<ContigInfo>& GcRank::contigs() const { return contigs_; }
 
 const Manifest& GcRank::manifest() const { return manifest_; }
 
-const ContigInfo* GcRank::contig(const std::string& name) const {
-  for (const ContigInfo& contig_info : contigs_)
-    if (contig_info.name == name) return &contig_info;
-  return nullptr;
+const ContigInfo* GcRank::contig(std::string_view name) const {
+  const auto found =
+      std::ranges::find_if(contigs_, [name](const ContigInfo& contig) {
+        return contig.name == name;
+      });
+  return found == contigs_.end() ? nullptr : &*found;
 }
 
 }  // namespace gcrank

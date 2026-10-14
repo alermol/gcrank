@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <string_view>
 
 #include "gcrank/format.h"
 
@@ -53,7 +54,7 @@ struct Manifest {
   // Parses and validates. `origin` only appears in error messages.
   // Throws FormatError on malformed JSON, a missing required key, an
   // unsupported bit order/endianness, or a different major format version.
-  static Manifest from_json(const std::string& text, const std::string& origin = "<memory>");
+  static Manifest from_json(std::string_view text, const std::string& origin = "<memory>");
 
   void save(const std::string& path) const;
   static Manifest load(const std::string& path);

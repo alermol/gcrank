@@ -39,14 +39,14 @@ void check_against_reference(const GcRank& index, const gctest::NaiveFasta& refe
     CHECK(index.gc_count(row.start, row.end) == row.gc_count);
     CHECK(index.valid_count(row.start, row.end) == row.valid_count);
     if (row.gc_fraction == "ERR") {
-      CHECK_THROWS_AS(index.gc_fraction(row.start, row.end, false), QueryError);
+      CHECK_THROWS_AS((void)index.gc_fraction(row.start, row.end, false), QueryError);
     } else {
       // Bit-for-bit against the single-precision value implied by the counts.
       CHECK(index.gc_fraction(row.start, row.end, false) ==
             gctest::expect_single(row.gc_count, row.length()));
     }
     if (row.gc_fraction_remove_ambiguous == "ERR") {
-      CHECK_THROWS_AS(index.gc_fraction(row.start, row.end, true), QueryError);
+      CHECK_THROWS_AS((void)index.gc_fraction(row.start, row.end, true), QueryError);
     } else {
       CHECK(index.gc_fraction(row.start, row.end, true) ==
             gctest::expect_single(row.gc_count, row.valid_count));
@@ -278,7 +278,7 @@ TEST_CASE("roundtrip: ambiguous bases are indexed but never counted") {
   CHECK(index.gc_count(coded_begin, coded_end) == 0);
   CHECK(index.valid_count(coded_begin, coded_end) == 0);
   CHECK(index.gc_fraction(coded_begin, coded_end, false) == 0.0);
-  CHECK_THROWS_AS(index.gc_fraction(coded_begin, coded_end, true), QueryError);
+  CHECK_THROWS_AS((void)index.gc_fraction(coded_begin, coded_end, true), QueryError);
 
   // A window made only of uracil: valid, never GC, no error either way.
   CHECK(index.gc_count(coded_end, total) == 0);
@@ -305,7 +305,7 @@ TEST_CASE("roundtrip: ambiguous bases are indexed but never counted") {
   CHECK(loaded.gc_count(0, total) == 4);
   CHECK(loaded.valid_count(0, total) == 8 + uracil);
   CHECK(loaded.gc_count(begin, finish) == 2);
-  CHECK_THROWS_AS(loaded.gc_fraction(coded_begin, coded_end, true), QueryError);
+  CHECK_THROWS_AS((void)loaded.gc_fraction(coded_begin, coded_end, true), QueryError);
   CHECK(loaded.gc_fraction(coded_end, total, true) == 0.0);
 }
 
@@ -396,10 +396,10 @@ TEST_CASE("roundtrip: query arguments are validated") {
 
   CHECK(index.gc_count(3, 3) == 0);
   CHECK(index.valid_count(3, 3) == 0);
-  CHECK_THROWS_AS(index.gc_count(10, 5), QueryError);
-  CHECK_THROWS_AS(index.gc_count(0, total + 1), QueryError);
-  CHECK_THROWS_AS(index.valid_count(0, total + 1), QueryError);
-  CHECK_THROWS_AS(index.gc_fraction(5, 5, false), QueryError);  // zero length
+  CHECK_THROWS_AS((void)index.gc_count(10, 5), QueryError);
+  CHECK_THROWS_AS((void)index.gc_count(0, total + 1), QueryError);
+  CHECK_THROWS_AS((void)index.valid_count(0, total + 1), QueryError);
+  CHECK_THROWS_AS((void)index.gc_fraction(5, 5, false), QueryError);  // zero length
 
   const ContigInfo* n_rich = index.contig("chr_n_rich");
   REQUIRE(n_rich != nullptr);
@@ -407,11 +407,11 @@ TEST_CASE("roundtrip: query arguments are validated") {
   CHECK(index.gc_count(n_rich->offset, n_rich->offset + 3) == 0);
   CHECK(index.valid_count(n_rich->offset, n_rich->offset + 3) == 0);
   CHECK(index.gc_fraction(n_rich->offset, n_rich->offset + 3, false) == 0.0);
-  CHECK_THROWS_AS(index.gc_fraction(n_rich->offset, n_rich->offset + 3, true), QueryError);
+  CHECK_THROWS_AS((void)index.gc_fraction(n_rich->offset, n_rich->offset + 3, true), QueryError);
 
   GcRank empty;
-  CHECK_THROWS_AS(empty.gc_count(0, 1), Error);
-  CHECK_THROWS_AS(empty.gc_fraction(0, 1), Error);
+  CHECK_THROWS_AS((void)empty.gc_count(0, 1), Error);
+  CHECK_THROWS_AS((void)empty.gc_fraction(0, 1), Error);
 }
 
 TEST_CASE("roundtrip: corrupted and incomplete indexes are rejected on load") {

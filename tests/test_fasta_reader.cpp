@@ -198,18 +198,18 @@ TEST_CASE("fasta: lower case is normalized to upper case") {
 
 TEST_CASE("format: base classification") {
   // Unambiguous DNA.
-  CHECK(base_class('A') == kBaseA);
-  CHECK(base_class('c') == kBaseC);
-  CHECK(base_class('G') == kBaseG);
-  CHECK(base_class('t') == kBaseT);
+  CHECK(base_class('A') == BaseClass::A);
+  CHECK(base_class('c') == BaseClass::C);
+  CHECK(base_class('G') == BaseClass::G);
+  CHECK(base_class('t') == BaseClass::T);
   CHECK(base_is_gc(base_class('G')));
   CHECK(base_is_gc(base_class('c')));
   CHECK(base_is_valid(base_class('T')));
   CHECK(!base_is_valid(base_class('N')));
 
   // Uracil is the RNA spelling of T: valid, never GC.
-  CHECK(base_class('U') == kBaseT);
-  CHECK(base_class('u') == kBaseT);
+  CHECK(base_class('U') == BaseClass::T);
+  CHECK(base_class('u') == BaseClass::T);
   CHECK(base_is_valid(base_class('U')));
   CHECK(!base_is_gc(base_class('U')));
   CHECK(normalized_base('u') == 'T');
@@ -218,7 +218,7 @@ TEST_CASE("format: base classification") {
   const std::string ambiguous = "NRYSWKMBDHVnryswkmbdhv";
   for (const char c : ambiguous) {
     CAPTURE(c);
-    CHECK(base_class(c) == kBaseAmbiguous);
+    CHECK(base_class(c) == BaseClass::Ambiguous);
     CHECK(base_is_ambiguous(base_class(c)));
     CHECK(!base_is_gc(base_class(c)));
     CHECK(!base_is_valid(base_class(c)));
@@ -235,11 +235,12 @@ TEST_CASE("format: base classification") {
   // Anything else is rejected, whitespace is skipped.
   for (const char c : std::string("XZ*-.0123#")) {
     CAPTURE(c);
-    CHECK(base_class(c) == kBaseInvalid);
+    CHECK(base_class(c) == BaseClass::Invalid);
   }
+
   for (const char c : std::string(" \t\v\f\r")) {
     CAPTURE(static_cast<int>(c));
-    CHECK(base_class(c) == kBaseWhitespace);
+    CHECK(base_class(c) == BaseClass::Whitespace);
   }
 }
 

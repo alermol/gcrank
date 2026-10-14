@@ -31,7 +31,7 @@ public:
   unsigned size() const { return static_cast<unsigned>(workers_.size()); }
 
   // Enqueues a task; ignored once the pool is stopping or aborted.
-  void submit(std::function<void()> task);
+  void submit(std::move_only_function<void()> task);
 
   // Blocks until all submitted tasks have finished (or the pool aborted) and
   // rethrows the first task exception, if any.
@@ -47,7 +47,7 @@ private:
   std::mutex mutex_;
   std::condition_variable cv_task_;
   std::condition_variable cv_done_;
-  std::deque<std::function<void()>> tasks_;
+  std::deque<std::move_only_function<void()>> tasks_;
   std::vector<std::thread> workers_;
   std::size_t active_ = 0;
   bool stopping_ = false;

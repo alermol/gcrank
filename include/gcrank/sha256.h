@@ -1,7 +1,7 @@
 #pragma once
 //
 // SHA-256 (FIPS 180-4), implemented from scratch: the library depends only on
-// the C++17 standard library and zlib, and zlib has no hash function.
+// the C++23 standard library and zlib, and zlib has no hash function.
 //
 #include <cstddef>
 #include <cstdint>

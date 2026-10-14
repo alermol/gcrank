@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "gcrank/input_stream.h"
@@ -59,12 +60,16 @@ public:
 private:
   enum class Phase { Start, InSequence, Done };
 
+  // Result of consuming sequence bytes from one line: how far the parser got
+  // and whether the block reached its capacity (needs flushing).
+  struct AppendResult {
+    std::size_t consumed = 0;
+    bool full = false;
+  };
+
   void parse_header();
-  // Appends sequence bytes line[begin, end) to the current block, advancing
-  // `*next` to the first byte that was not consumed. Sets `*full` when the
-  // block reached its capacity.
-  void append_sequence(const char* line, std::size_t begin, std::size_t end,
-                       std::size_t* next, bool* full);
+  // Appends sequence bytes of `line` starting at `begin` to the current block.
+  AppendResult append_sequence(std::string_view line, std::size_t begin);
   bool line_is_blank() const;
 
   std::unique_ptr<InputStream> in_;
@@ -77,8 +82,7 @@ private:
   bool at_eof_ = false;
   bool block_valid_ = false;
 
-  const char* line_ = nullptr;
-  std::size_t line_len_ = 0;
+  std::string_view line_;
   std::size_t line_pos_ = 0;
   bool have_line_ = false;
 

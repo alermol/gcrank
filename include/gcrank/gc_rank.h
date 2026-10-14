@@ -8,6 +8,7 @@
 //
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "gcrank/bitvector.h"
@@ -40,7 +41,7 @@ struct OpenOptions {
 };
 
 // Default worker count: min(8, hardware_concurrency()), never below 1.
-unsigned default_threads();
+[[nodiscard]] unsigned default_threads();
 
 class GcRank {
 public:
@@ -72,10 +73,10 @@ public:
   // Number of unambiguous G/C bases in the window. Ambiguity codes (N, U, R,
   // Y, S, W, K, M, B, D, H, V) are never counted, so this is a lower bound for
   // windows that contain them.
-  uint64_t gc_count(uint64_t start, uint64_t end) const;
+  [[nodiscard]] uint64_t gc_count(uint64_t start, uint64_t end) const;
   // Number of unambiguous A/C/G/T bases in the window; N, U and the IUPAC
   // ambiguity codes are excluded.
-  uint64_t valid_count(uint64_t start, uint64_t end) const;
+  [[nodiscard]] uint64_t valid_count(uint64_t start, uint64_t end) const;
   // GC fraction of the window, computed exactly like `bedtools nuc`: the
   // integer counts are converted to `float` and divided in single precision,
   // and the result is returned as a double holding that single-precision
@@ -89,15 +90,16 @@ public:
   // removed (bedtools has no such column). The window must then hold at least
   // one A/C/G/T base, otherwise QueryError is thrown, as it is for a
   // zero-length window either way.
-  double gc_fraction(uint64_t start, uint64_t end, bool remove_ambiguous = false) const;
+  [[nodiscard]] double gc_fraction(uint64_t start, uint64_t end,
+                                   bool remove_ambiguous = false) const;
 
   // ---- metadata ----------------------------------------------------------
 
-  uint64_t total_bases() const;
-  const std::vector<ContigInfo>& contigs() const;
-  const Manifest& manifest() const;
+  [[nodiscard]] uint64_t total_bases() const;
+  [[nodiscard]] const std::vector<ContigInfo>& contigs() const;
+  [[nodiscard]] const Manifest& manifest() const;
   // Linear lookup by contig name; returns nullptr when absent.
-  const ContigInfo* contig(const std::string& name) const;
+  [[nodiscard]] const ContigInfo* contig(std::string_view name) const;
 
 private:
   void check_range(uint64_t start, uint64_t end) const;

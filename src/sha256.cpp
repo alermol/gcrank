@@ -1,16 +1,16 @@
 #include "gcrank/sha256.h"
 
+#include <array>
+#include <bit>
 #include <cstring>
 #include <fstream>
-#include <vector>
+#include <span>
 
 #include "gcrank/error.h"
 
 namespace gcrank {
 
 namespace {
-
-inline uint32_t rotr(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
 
 const uint32_t kK[64] = {
     0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu, 0x59f111f1u,
@@ -26,7 +26,18 @@ const uint32_t kK[64] = {
     0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u,
 };
 
-const char kHexDigits[] = "0123456789abcdef";
+constexpr char kHexDigits[] = "0123456789abcdef";
+constexpr std::size_t kBufferBytes = 1u << 18;
+
+// Lowercase hex rendering of a digest.
+std::string hex_encode(std::span<const uint8_t> digest) {
+  std::string out(digest.size() * 2, '0');
+  for (std::size_t i = 0; i < digest.size(); ++i) {
+    out[2 * i] = kHexDigits[digest[i] >> 4];
+    out[2 * i + 1] = kHexDigits[digest[i] & 0x0F];
+  }
+  return out;
+}
 
 }  // namespace
 
@@ -52,18 +63,18 @@ void SHA256::transform(const uint8_t block[64]) {
            static_cast<uint32_t>(block[4 * i + 3]);
   }
   for (int i = 16; i < 64; ++i) {
-    const uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
-    const uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+    const uint32_t s0 = std::rotr(w[i - 15], 7) ^ std::rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+    const uint32_t s1 = std::rotr(w[i - 2], 17) ^ std::rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
     w[i] = w[i - 16] + s0 + w[i - 7] + s1;
   }
 
   uint32_t a = h_[0], b = h_[1], c = h_[2], d = h_[3];
   uint32_t e = h_[4], f = h_[5], g = h_[6], h = h_[7];
   for (int i = 0; i < 64; ++i) {
-    const uint32_t s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+    const uint32_t s1 = std::rotr(e, 6) ^ std::rotr(e, 11) ^ std::rotr(e, 25);
     const uint32_t ch = (e & f) ^ (~e & g);
     const uint32_t t1 = h + s1 + ch + kK[i] + w[i];
-    const uint32_t s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+    const uint32_t s0 = std::rotr(a, 2) ^ std::rotr(a, 13) ^ std::rotr(a, 22);
     const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
     const uint32_t t2 = s0 + maj;
     h = g;
@@ -136,19 +147,14 @@ std::string sha256_hex(const void* data, std::size_t n) {
   h.update(data, n);
   uint8_t digest[32];
   h.finish(digest);
-  std::string out(64, '0');
-  for (int i = 0; i < 32; ++i) {
-    out[static_cast<std::size_t>(2 * i)] = kHexDigits[digest[i] >> 4];
-    out[static_cast<std::size_t>(2 * i) + 1] = kHexDigits[digest[i] & 0x0F];
-  }
-  return out;
+  return hex_encode(digest);
 }
 
 std::string sha256_file_hex(const std::string& path) {
   std::ifstream in(path, std::ios::binary);
   if (!in) throw IoError("cannot open '" + path + "' for reading");
   SHA256 h;
-  std::vector<char> buf(1u << 18);
+  std::array<char, kBufferBytes> buf;
   while (in) {
     in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
     const std::streamsize got = in.gcount();
@@ -157,12 +163,7 @@ std::string sha256_file_hex(const std::string& path) {
   if (in.bad()) throw IoError("read error on '" + path + "'");
   uint8_t digest[32];
   h.finish(digest);
-  std::string out(64, '0');
-  for (int i = 0; i < 32; ++i) {
-    out[static_cast<std::size_t>(2 * i)] = kHexDigits[digest[i] >> 4];
-    out[static_cast<std::size_t>(2 * i) + 1] = kHexDigits[digest[i] & 0x0F];
-  }
-  return out;
+  return hex_encode(digest);
 }
 
 }  // namespace gcrank

@@ -2,9 +2,11 @@
 
 #include <zlib.h>
 
+#include <array>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 
 #include "gcrank/error.h"
 
@@ -72,17 +74,17 @@ std::size_t GzipInputStream::read(void* dst, std::size_t n) {
 // ---- open_input ----------------------------------------------------------
 
 std::unique_ptr<InputStream> open_input(const std::string& path) {
-  unsigned char magic[2] = {0, 0};
+  std::array<unsigned char, 2> magic{};
   std::size_t got = 0;
   if (std::FILE* f = std::fopen(path.c_str(), "rb")) {
-    got = std::fread(magic, 1, 2, f);
+    got = std::fread(magic.data(), 1, magic.size(), f);
     std::fclose(f);
   } else {
     throw InputError("cannot open '" + path + "' for reading: " + std::strerror(errno));
   }
-  if (got == 2 && magic[0] == 0x1f && magic[1] == 0x8b)
-    return std::unique_ptr<InputStream>(new GzipInputStream(path));
-  return std::unique_ptr<InputStream>(new PlainInputStream(path));
+  if (got == magic.size() && magic[0] == 0x1f && magic[1] == 0x8b)
+    return std::make_unique<GzipInputStream>(path);
+  return std::make_unique<PlainInputStream>(path);
 }
 
 // ---- MappedFile ----------------------------------------------------------
@@ -92,18 +94,13 @@ MappedFile::MappedFile(MappedFile&& other) noexcept { *this = std::move(other); 
 MappedFile& MappedFile::operator=(MappedFile&& other) noexcept {
   if (this != &other) {
     reset();
-    data_ = other.data_;
-    size_ = other.size_;
+    data_ = std::exchange(other.data_, nullptr);
+    size_ = std::exchange(other.size_, 0);
     name_ = std::move(other.name_);
-    mapped_ = other.mapped_;
-    other.data_ = nullptr;
-    other.size_ = 0;
-    other.mapped_ = false;
+    mapped_ = std::exchange(other.mapped_, false);
 #ifdef _WIN32
-    file_handle_ = other.file_handle_;
-    mapping_handle_ = other.mapping_handle_;
-    other.file_handle_ = nullptr;
-    other.mapping_handle_ = nullptr;
+    file_handle_ = std::exchange(other.file_handle_, nullptr);
+    mapping_handle_ = std::exchange(other.mapping_handle_, nullptr);
 #endif
   }
   return *this;
