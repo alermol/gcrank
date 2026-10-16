@@ -32,12 +32,17 @@ struct JsonValue {
   double number = 0.0;
   std::string text;
   std::vector<JsonValue> array;
-  // Objects keep insertion order; the writer sorts for canonical output.
-  std::vector<std::pair<std::string, JsonValue>> object;
+  // Object members are kept as parallel key/value arrays, in insertion order.
+  // A std::vector<std::pair<std::string, JsonValue>> member would need the
+  // pair to be complete while JsonValue is still being defined, which is not
+  // portable (Clang rejects it; GCC accepts it by accident). The writer sorts
+  // the keys for canonical output.
+  std::vector<std::string> keys;
+  std::vector<JsonValue> values;
 
   const JsonValue* find(std::string_view key) const {
-    for (const auto& entry : object)
-      if (entry.first == key) return &entry.second;
+    for (std::size_t i = 0; i < values.size(); ++i)
+      if (keys[i] == key) return &values[i];
     return nullptr;
   }
   static JsonValue make_string(std::string s) {
@@ -65,7 +70,8 @@ struct JsonValue {
     return v;
   }
   void set(const std::string& key, JsonValue value) {
-    object.emplace_back(key, std::move(value));
+    keys.push_back(key);
+    values.push_back(std::move(value));
   }
 };
 
@@ -166,7 +172,9 @@ private:
       skip_whitespace();
       expect(':');
       skip_whitespace();
-      v.object.emplace_back(std::move(key), parse_value());
+      JsonValue member = parse_value();
+      v.keys.push_back(std::move(key));
+      v.values.push_back(std::move(member));
       skip_whitespace();
       const char c = peek();
       if (c == ',') {
@@ -414,22 +422,23 @@ void write_json(const JsonValue& value, std::string& out, int depth) {
       break;
     }
     case JsonValue::Type::Object: {
-      if (value.object.empty()) {
+      if (value.values.empty()) {
         out += "{}";
         break;
       }
-      std::vector<const std::pair<std::string, JsonValue>*> entries;
-      entries.reserve(value.object.size());
-      for (const auto& entry : value.object) entries.push_back(&entry);
-      std::ranges::sort(entries, std::less<>{},
-                        [](const auto* entry) -> const std::string& { return entry->first; });
+      std::vector<std::size_t> order(value.values.size());
+      for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+      std::ranges::sort(order, std::less<>{}, [&value](std::size_t i) -> const std::string& {
+        return value.keys[i];
+      });
       out += "{\n";
-      for (std::size_t i = 0; i < entries.size(); ++i) {
+      for (std::size_t i = 0; i < order.size(); ++i) {
+        const std::size_t at = order[i];
         out += pad_inner;
-        write_json_string(entries[i]->first, out);
+        write_json_string(value.keys[at], out);
         out += ": ";
-        write_json(entries[i]->second, out, depth + 1);
-        out += (i + 1 < entries.size()) ? ",\n" : "\n";
+        write_json(value.values[at], out, depth + 1);
+        out += (i + 1 < order.size()) ? ",\n" : "\n";
       }
       out += pad;
       out += "}";
@@ -633,7 +642,9 @@ Manifest Manifest::from_json(std::string_view text, const std::string& origin) {
   }
 
   const JsonValue& semantics = require_object(root, "semantics", ctx);
-  for (const auto& [key, value] : semantics.object) {
+  for (std::size_t i = 0; i < semantics.values.size(); ++i) {
+    const std::string& key = semantics.keys[i];
+    const JsonValue& value = semantics.values[i];
     if (value.type != JsonValue::Type::String)
       throw FormatError(ctx + ": semantics." + key + " must be a string");
     manifest.semantics[key] = value.text;
