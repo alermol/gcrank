@@ -19,6 +19,8 @@
 #include <string>
 #include <vector>
 
+#include "gcrank/detail/crc32.h"
+
 #if defined(__linux__)
 #include <unistd.h>
 #endif
@@ -111,6 +113,55 @@ inline std::string diff_dirs(const fs::path& a, const fs::path& b) {
   for (const std::string& name : left)
     if (read_bytes(a / name) != read_bytes(b / name)) return "different bytes in " + name;
   return std::string();
+}
+
+// ---- gzip fixtures -------------------------------------------------------
+//
+// A minimal gzip writer using deflate "stored" (uncompressed) blocks, so tests
+// can build exact gzip byte streams — multi-member files, truncated members,
+// corrupt trailers — without shelling out to gzip or linking zlib.
+
+inline void append_le16(std::string& out, uint16_t value) {
+  out.push_back(static_cast<char>(value & 0xFFu));
+  out.push_back(static_cast<char>((value >> 8) & 0xFFu));
+}
+
+inline void append_le32(std::string& out, uint32_t value) {
+  for (int i = 0; i < 4; ++i) out.push_back(static_cast<char>((value >> (8 * i)) & 0xFFu));
+}
+
+// One gzip member that decompresses to `payload`.
+inline std::string gzip_member(const std::string& payload) {
+  std::string out;
+  out += '\x1f';
+  out += '\x8b';
+  out += '\x08';   // CM = deflate
+  out += '\x00';   // FLG = 0
+  append_le32(out, 0);  // MTIME = 0
+  out += '\x00';   // XFL
+  out += '\xff';   // OS = unknown
+  std::size_t offset = 0;
+  do {
+    const std::size_t chunk = std::min<std::size_t>(65535, payload.size() - offset);
+    const bool last = offset + chunk >= payload.size();
+    // BFINAL/BTYPE in the low three bits of the first byte; stored blocks are
+    // byte aligned, so the rest of that byte is padding.
+    out.push_back(static_cast<char>(last ? 0x01 : 0x00));
+    append_le16(out, static_cast<uint16_t>(chunk));
+    append_le16(out, static_cast<uint16_t>(~chunk));
+    out.append(payload, offset, chunk);
+    offset += chunk;
+  } while (offset < payload.size());
+  append_le32(out, ::gcrank::CRC32::compute(payload.data(), payload.size()));
+  append_le32(out, static_cast<uint32_t>(payload.size() & 0xFFFFFFFFu));
+  return out;
+}
+
+// A valid gzip stream made of several members, like `cat a.gz b.gz`.
+inline std::string gzip_multi_member(const std::vector<std::string>& parts) {
+  std::string out;
+  for (const std::string& part : parts) out += gzip_member(part);
+  return out;
 }
 
 // ---- guards --------------------------------------------------------------

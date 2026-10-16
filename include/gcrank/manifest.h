@@ -19,9 +19,12 @@ namespace gcrank {
 
 // Where the index came from.
 struct SourceInfo {
-  std::string path;         // path as passed to the builder
-  std::string sha256;       // hex SHA-256 of the source bytes as stored
-  uint64_t file_bytes = 0;  // size of the source file on disk
+  std::string path;         // path as passed to the builder ("-" for stdin)
+  // Hex SHA-256 of the parsed byte stream: the decompressed bytes for gzip
+  // input, so a file and its gzip form hash identically. The source is hashed
+  // while it is parsed, so this always describes exactly the indexed bytes.
+  std::string sha256;
+  uint64_t file_bytes = 0;  // bytes parsed (decompressed size for gzip input)
   uint64_t total_bases = 0; // bases over all contigs (including N)
   uint64_t num_contigs = 0;
 };
@@ -37,10 +40,21 @@ struct Manifest {
 
   // Index description
   std::string bit_order = kBitOrderMsb0;
-  std::string endianness = host_endianness_name();
+  // Byte order of the .rb scalars. Writers store little-endian; readers swap
+  // when this says "big", so an index in the opposite byte order is read
+  // correctly.
+  std::string endianness = kEndiannessLittle;
   uint32_t superblock_bits = kSuperblockBits;
   uint32_t basic_block_bits = kBasicBlockBits;
   bool remove_ambiguous_supported = true;
+
+  // Population counts of the two bitvectors (`total_gc` and `total_valid` in
+  // the JSON `index` object). Optional on read; on load they are cross-checked
+  // against the end-of-vector ranks, which catches a corrupt rank index even
+  // when the full data-file CRCs are not validated.
+  bool has_totals = false;
+  uint64_t total_gc = 0;     // set bits of genome.bv
+  uint64_t total_valid = 0;  // set bits of valid.bv
 
   // Data file sizes and checksums
   std::map<std::string, FileInfo> files;

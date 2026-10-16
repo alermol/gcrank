@@ -1,4 +1,4 @@
-#include "gcrank/line_reader.h"
+#include "gcrank/detail/line_reader.h"
 
 #include <cstring>
 #include <string_view>
@@ -25,50 +25,42 @@ bool LineReader::fill() {
   end_ = in_.read(buf_.data(), buf_.size());
   if (end_ == 0) {
     eof_ = true;
+    in_line_ = false;
     return false;
   }
   return true;
 }
 
-bool LineReader::next(const char** data, std::size_t* len) {
-  scratch_.clear();
+LineReader::Status LineReader::next(const char** data, std::size_t* len) {
   for (;;) {
     if (begin_ < end_) {
       const char* base = buf_.data();
       const char* nl =
           static_cast<const char*>(std::memchr(base + begin_, '\n', end_ - begin_));
       if (nl != nullptr) {
-        std::size_t line_len = static_cast<std::size_t>(nl - (base + begin_));
         const char* line = base + begin_;
+        std::size_t line_len = static_cast<std::size_t>(nl - line);
         begin_ = static_cast<std::size_t>(nl - base) + 1;
-        if (!scratch_.empty()) {
-          // The line started in an earlier buffer; join the pieces.
-          scratch_.append(line, line_len);
-          line = scratch_.data();
-          line_len = scratch_.size();
-        }
+        if (!in_line_) ++line_number_;
+        in_line_ = false;
         line_len = without_cr(std::string_view(line, line_len));
-        ++line_number_;
         *data = line_len > 0 ? line : nullptr;
         *len = line_len;
-        return true;
+        return Status::Line;
       }
-      // No terminator in the rest of the buffer: keep it and read on.
-      scratch_.append(base + begin_, end_ - begin_);
-      begin_ = end_ = 0;
-    }
-    if (!fill()) {
-      if (!scratch_.empty()) {
-        // Unterminated last line. The pointer must stay valid until the next
-        // call, so scratch_ is not cleared here.
-        const std::size_t line_len = without_cr(scratch_);
+      // No terminator in the rest of the buffer: hand out what is there as a
+      // piece of the current line, with no copy. The pointer stays valid until
+      // the next call; the caller must treat the line as unterminated.
+      if (!in_line_) {
         ++line_number_;
-        *data = line_len > 0 ? scratch_.data() : nullptr;
-        *len = line_len;
-        return true;
+        in_line_ = true;
       }
-      return false;
+      *data = base + begin_;
+      *len = end_ - begin_;
+      begin_ = end_;
+      return Status::Partial;
     }
+    if (!fill()) return Status::End;
   }
 }
 

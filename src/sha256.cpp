@@ -1,4 +1,4 @@
-#include "gcrank/sha256.h"
+#include "gcrank/detail/sha256.h"
 
 #include <array>
 #include <bit>
@@ -148,6 +148,10 @@ std::string sha256_hex(const void* data, std::size_t n) {
   uint8_t digest[32];
   h.finish(digest);
   return hex_encode(digest);
+}
+
+std::string sha256_hex_from_digest(const uint8_t digest[32]) {
+  return hex_encode(std::span<const uint8_t>(digest, 32));
 }
 
 std::string sha256_file_hex(const std::string& path) {

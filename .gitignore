@@ -3,7 +3,8 @@ build/
 build-*/
 cmake-build-*/
 
-# Editor and OS noise
+# Editor and tool caches
+.cache/
 .vscode/
 .idea/
 *.swp

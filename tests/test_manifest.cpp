@@ -5,10 +5,10 @@
 #include <string>
 #include <vector>
 
-#include "gcrank/crc32.h"
+#include "gcrank/detail/crc32.h"
 #include "gcrank/format.h"
 #include "gcrank/manifest.h"
-#include "gcrank/sha256.h"
+#include "gcrank/detail/sha256.h"
 #include "test_util.h"
 
 using namespace gcrank;
@@ -134,15 +134,15 @@ TEST_CASE("manifest: a different major version is rejected") {
   const std::string renamed = std::string("\"format_version_\": \"") + kFormatVersion + "\"";
   const std::size_t position = text.find(renamed);
   REQUIRE(position != std::string::npos);
-  text.replace(position, renamed.size(), "\"format_version\": \"2.0.0\"");
+  text.replace(position, renamed.size(), "\"format_version\": \"9.0.0\"");
   CHECK_THROWS_AS(Manifest::from_json(text, "test"), FormatError);
 
   // Same major, newer minor: accepted.
   std::string minor = sample_manifest().to_json();
   const std::size_t at = minor.find(current);
   REQUIRE(at != std::string::npos);
-  minor.replace(at, current.size(), "\"format_version\": \"1.9.3\"");
-  CHECK(Manifest::from_json(minor, "test").format_version == "1.9.3");
+  minor.replace(at, current.size(), "\"format_version\": \"0.9.3\"");
+  CHECK(Manifest::from_json(minor, "test").format_version == "0.9.3");
 
   // Not a version number at all.
   std::string bad = sample_manifest().to_json();
@@ -215,6 +215,66 @@ TEST_CASE("manifest: malformed JSON is rejected") {
   CHECK_THROWS_AS(Manifest::from_json("[1, 2, 3]", "test"), FormatError);
   CHECK_THROWS_AS(Manifest::from_json("{\"a\": \"\\uD800\"}", "test"), FormatError);
   CHECK_THROWS_AS(Manifest::from_json("{\"a\": 'single'}", "test"), FormatError);
+}
+
+TEST_CASE("manifest: hostile JSON constructs are rejected") {
+  const auto replace_once = [](std::string text, const std::string& from, const std::string& to) {
+    const std::size_t position = text.find(from);
+    if (position != std::string::npos) text.replace(position, from.size(), to);
+    return text;
+  };
+  const std::string base = sample_manifest().to_json();
+  // Inject a value under a key the reader ignores, so the schema itself stays
+  // valid and only the JSON parser decides.
+  const auto with_value = [&](const std::string& raw) {
+    return replace_once(base, "{\n", "{\n  \"ignored\": " + raw + ",\n");
+  };
+
+  // A lone low surrogate is not valid UTF-8 and must not be emitted;
+  // a well-formed surrogate pair must decode to the right code point.
+  CHECK_THROWS_WITH(Manifest::from_json(with_value("\"\\uDC00\""), "test"),
+                    doctest::Contains("lone low surrogate"));
+  CHECK_THROWS_WITH(Manifest::from_json(with_value("\"\\uD800x\""), "test"),
+                    doctest::Contains("missing low surrogate"));
+  {
+    const Manifest parsed =
+        Manifest::from_json(with_value("\"\\uD83D\\uDE00\""), "test");
+    CHECK(parsed.source.num_contigs == 7);  // the rest of the document survived
+  }
+
+  // Numbers: no leading zeros, and a fraction/exponent needs digits.
+  CHECK_THROWS_WITH(Manifest::from_json(with_value("01"), "test"),
+                    doctest::Contains("leading zeros"));
+  CHECK_THROWS_WITH(Manifest::from_json(with_value("-00"), "test"),
+                    doctest::Contains("leading zeros"));
+  CHECK_THROWS_WITH(Manifest::from_json(with_value("1."), "test"),
+                    doctest::Contains("expected a digit after '.'"));
+  CHECK_THROWS_WITH(Manifest::from_json(with_value("1e}"), "test"),
+                    doctest::Contains("exponent"));
+  CHECK_NOTHROW(Manifest::from_json(with_value("0"), "test"));
+  CHECK_NOTHROW(Manifest::from_json(with_value("0.5"), "test"));
+  CHECK_NOTHROW(Manifest::from_json(with_value("1e10"), "test"));
+
+  // Unbounded nesting is refused instead of recursing until the stack dies.
+  std::string deep = "{\"a\": ";
+  for (int i = 0; i < 200; ++i) deep += '[';
+  for (int i = 0; i < 200; ++i) deep += ']';
+  deep += '}';
+  CHECK_THROWS_WITH(Manifest::from_json(deep, "test"),
+                    doctest::Contains("nesting is too deep"));
+}
+
+TEST_CASE("manifest: source field types are checked") {
+  const auto replace_once = [](std::string text, const std::string& from, const std::string& to) {
+    const std::size_t position = text.find(from);
+    if (position != std::string::npos) text.replace(position, from.size(), to);
+    return text;
+  };
+  const std::string base = sample_manifest().to_json();
+  CHECK_THROWS_AS(Manifest::from_json(replace_once(base, "\"file_bytes\": 11530",
+                                                   "\"file_bytes\": \"11530\""),
+                                      "test"),
+                  FormatError);
 }
 
 TEST_CASE("manifest: trailing whitespace after the document is accepted") {

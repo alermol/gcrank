@@ -8,7 +8,7 @@
 
 #include "gcrank/error.h"
 #include "gcrank/gc_rank.h"
-#include "gcrank/input_stream.h"
+#include "gcrank/detail/input_stream.h"
 #include "test_util.h"
 
 using namespace gcrank;
@@ -66,15 +66,15 @@ TEST_CASE("mmap: mapped and heap loads answer identically") {
   const fs::path dir = tmp.file("synthetic.gcrank");
 
   GcRank heap;
-  heap.load(dir.string(), OpenOptions{/*validate_crc=*/true, /*mmap=*/false});
+  heap.load(dir.string(), OpenOptions{/*validate_crc=*/true, /*mmap=*/false, {}});
   GcRank mapped;
-  mapped.load(dir.string(), OpenOptions{/*validate_crc=*/true, /*mmap=*/true});
+  mapped.load(dir.string(), OpenOptions{/*validate_crc=*/true, /*mmap=*/true, {}});
   check_same_answers(heap, mapped, fasta);
   check_same_answers(builder, mapped, fasta);
 
   // Without checksum validation the mapped load must still be usable.
   GcRank mapped_fast;
-  mapped_fast.load(dir.string(), OpenOptions{false, true});
+  mapped_fast.load(dir.string(), OpenOptions{false, true, {}});
   check_same_answers(heap, mapped_fast, fasta);
 }
 
@@ -110,7 +110,7 @@ TEST_CASE("mmap: mapped files are not copied into heap memory") {
   int64_t mmap_growth = 0;
   {
     GcRank mapped;
-    mapped.load(dir.string(), OpenOptions{/*validate_crc=*/false, /*mmap=*/true});
+    mapped.load(dir.string(), OpenOptions{/*validate_crc=*/false, /*mmap=*/true, {}});
     mmap_growth = static_cast<int64_t>(gctest::rss_bytes()) - static_cast<int64_t>(rss_before);
     CHECK(mapped.gc_count(0, total) == expected_gc);
     CHECK(mapped.valid_count(0, total) == expected_valid);
@@ -121,7 +121,7 @@ TEST_CASE("mmap: mapped files are not copied into heap memory") {
   int64_t heap_growth = 0;
   {
     GcRank heap;
-    heap.load(dir.string(), OpenOptions{/*validate_crc=*/false, /*mmap=*/false});
+    heap.load(dir.string(), OpenOptions{/*validate_crc=*/false, /*mmap=*/false, {}});
     heap_growth = static_cast<int64_t>(gctest::rss_bytes()) - static_cast<int64_t>(rss_after_mmap);
     CHECK(heap.gc_count(0, total) == expected_gc);
     CHECK(heap.valid_count(0, total) == expected_valid);

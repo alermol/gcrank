@@ -2,29 +2,38 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <iterator>
 #include <mutex>
-#include <print>
 #include <span>
 #include <string_view>
 #include <thread>
 #include <utility>
 
-#include "gcrank/crc32.h"
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+#include "gcrank/detail/bitvector.h"
+#include "gcrank/detail/crc32.h"
 #include "gcrank/error.h"
-#include "gcrank/fasta_reader.h"
+#include "gcrank/detail/fasta_reader.h"
 #include "gcrank/format.h"
-#include "gcrank/input_stream.h"
-#include "gcrank/sha256.h"
-#include "gcrank/thread_pool.h"
+#include "gcrank/detail/input_stream.h"
+#include "gcrank/detail/sha256.h"
+#include "gcrank/detail/thread_pool.h"
 
 namespace gcrank {
 
@@ -96,11 +105,12 @@ struct PipelineAbort {};
 
 class BuildPipeline {
 public:
-  BuildPipeline(std::string path, uint64_t chunk_bases, unsigned workers, bool verbose)
-      : path_(std::move(path)),
+  BuildPipeline(InputStream& input, uint64_t chunk_bases, unsigned workers, bool verbose,
+                const LogSink& log)
+      : input_(input),
         chunk_(chunk_bases),
-        workers_(workers),
         verbose_(verbose),
+        log_(log),
         capacity_(static_cast<uint64_t>(workers) + 2),
         slots_(static_cast<std::size_t>(capacity_)),
         pool_(workers) {}
@@ -110,7 +120,6 @@ public:
     valid_ = &valid;
     contigs_ = &contigs;
     producer_ = std::jthread([this](std::stop_token stop) { produce(stop); });
-    for (unsigned i = 0; i < workers_; ++i) pool_.submit([this] { work_loop(); });
     try {
       assemble();
     } catch (...) {
@@ -121,16 +130,20 @@ public:
   }
 
 private:
+  void log(LogLevel level, std::string message) {
+    if (log_) log_(level, message);
+  }
+
   // ---- producer ----------------------------------------------------------
 
   void produce(std::stop_token stop) {
     try {
-      std::unique_ptr<FastaReader> reader = FastaReader::from_path(path_, chunk_);
+      FastaReader reader(input_, chunk_);
       uint64_t index = 0;
       uint64_t bases = 0;
       auto next_progress = std::chrono::steady_clock::now() + std::chrono::seconds(4);
       for (;;) {
-        const FastaReader::Event event = reader->next();
+        const FastaReader::Event event = reader.next();
         if (event == FastaReader::Event::End) break;
 
         Slot& slot = slots_[static_cast<std::size_t>(index % capacity_)];
@@ -147,11 +160,13 @@ private:
         switch (event) {
           case FastaReader::Event::ContigBegin:
             slot.kind = Slot::Kind::ContigBegin;
-            slot.name = reader->contig_name();
+            slot.name = reader.contig_name();
             break;
           case FastaReader::Event::Block:
             slot.kind = Slot::Kind::Block;
-            slot.bases.assign(reader->block().begin(), reader->block().end());
+            // Take the reader's buffer instead of copying it; the slot returns
+            // its old buffer, so both sides keep their capacity.
+            reader.take_block(slot.bases);
             slot.nbases = static_cast<uint64_t>(slot.bases.size());
             bases += slot.nbases;
             is_block = true;
@@ -170,17 +185,11 @@ private:
           const auto now = std::chrono::steady_clock::now();
           if (now >= next_progress) {
             next_progress = now + std::chrono::seconds(4);
-            std::lock_guard<std::mutex> log(verbose_mutex_);
-            std::print(stderr, "[gcrank] parsed {} bases\r", bases);
-            std::fflush(stderr);
+            log(LogLevel::Info, std::format("parsed {} bases", bases));
           }
         }
       }
-      if (verbose_) {
-        std::lock_guard<std::mutex> log(verbose_mutex_);
-        std::print(stderr, "[gcrank] parsed {} bases\n", bases);
-        std::fflush(stderr);
-      }
+      if (verbose_) log(LogLevel::Info, std::format("parsed {} bases", bases));
     } catch (const PipelineAbort&) {
       // The assembler is failing; unwind quietly.
     } catch (...) {
@@ -196,15 +205,13 @@ private:
 
   void publish(uint64_t index, bool is_block) {
     if (is_block) {
+      // One pool task per block: the pool's queue is the work queue, so this
+      // class keeps no second one.
       {
         std::lock_guard<std::mutex> lock(mutex_);
         produce_index_ = index + 1;
       }
-      {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        work_.push_back(index);
-      }
-      cv_work_.notify_one();
+      pool_.submit([this, index] { pack_slot(index); });
     } else {
       {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -217,35 +224,25 @@ private:
 
   // ---- workers -----------------------------------------------------------
 
-  void work_loop() {
-    for (;;) {
-      uint64_t index = 0;
-      {
-        std::unique_lock<std::mutex> lock(queue_mutex_);
-        cv_work_.wait(lock, [&] { return !work_.empty() || workers_stop_ || failed_.load(); });
-        if (work_.empty()) return;
-        index = work_.front();
-        work_.pop_front();
-      }
-      Slot& slot = slots_[static_cast<std::size_t>(index % capacity_)];
-      try {
-        pack_block(slot.bases, slot.gc_words, slot.valid_words);
-        // Keep the capacity for reuse; this is the buffer the peak-memory
-        // budget is about.
-        slot.bases.clear();
-      } catch (...) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!worker_error_) worker_error_ = std::current_exception();
-        failed_ = true;
-        cv_ready_.notify_all();
-        return;
-      }
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        slot.ready = true;
-      }
-      cv_ready_.notify_one();
+  void pack_slot(uint64_t index) {
+    Slot& slot = slots_[static_cast<std::size_t>(index % capacity_)];
+    try {
+      pack_block(slot.bases, slot.gc_words, slot.valid_words);
+      // Keep the capacity for reuse; this is the buffer the peak-memory
+      // budget is about.
+      slot.bases.clear();
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!worker_error_) worker_error_ = std::current_exception();
+      failed_ = true;
+      cv_ready_.notify_all();
+      return;
     }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      slot.ready = true;
+    }
+    cv_ready_.notify_one();
   }
 
   // ---- assembler (calling thread) ----------------------------------------
@@ -303,11 +300,6 @@ private:
 
   void shutdown() {
     producer_.request_stop();
-    {
-      std::lock_guard<std::mutex> lock(queue_mutex_);
-      workers_stop_ = true;
-    }
-    cv_work_.notify_all();
     cv_free_.notify_all();
     cv_ready_.notify_all();
     if (producer_.joinable()) producer_.join();
@@ -319,10 +311,10 @@ private:
     }
   }
 
-  std::string path_;
+  InputStream& input_;
   uint64_t chunk_;
-  unsigned workers_;
   bool verbose_;
+  const LogSink& log_;
   uint64_t capacity_;
   std::vector<Slot> slots_;
 
@@ -336,12 +328,6 @@ private:
   std::exception_ptr worker_error_;
   std::atomic<bool> failed_{false};
 
-  std::mutex queue_mutex_;
-  std::condition_variable cv_work_;
-  std::deque<uint64_t> work_;
-  bool workers_stop_ = false;
-
-  std::mutex verbose_mutex_;
   std::jthread producer_;
   ThreadPool pool_;
 
@@ -360,7 +346,8 @@ FileInfo write_contigs(const fs::path& path, const std::vector<ContigInfo>& cont
   std::string line;
   for (const ContigInfo& contig : contigs) {
     if (contig.name.find('\n') != std::string::npos)
-      throw Error("contig name contains a newline; refusing to write '" + path.string() + "'");
+      throw InputError("contig name contains a newline; refusing to write '" + path.string() +
+                       "'");
     line.clear();
     std::format_to(std::back_inserter(line), "{}\t{}\t{}\n", contig.name, contig.length,
                    contig.offset);
@@ -463,8 +450,72 @@ std::string verify_index_files(const fs::path& dir, const Manifest& manifest) {
   return std::string();
 }
 
+// A token that is unique among concurrent saves: the process id plus a
+// per-process counter, so two saves of the same index cannot share a
+// temporary directory.
+std::string unique_save_token() {
+  static std::atomic<uint64_t> counter{0};
+#if defined(_WIN32)
+  const uint64_t pid = static_cast<uint64_t>(::_getpid());
+#else
+  const uint64_t pid = static_cast<uint64_t>(::getpid());
+#endif
+  return std::to_string(pid) + "." + std::to_string(counter.fetch_add(1));
+}
+
+// Flushes a file (or, on a best-effort basis, a directory) to stable storage.
+// The temp-directory rename is only crash-safe once the bytes it publishes have
+// reached the disk, because verify_index_files() re-reads through the page
+// cache and proves nothing about durability.
+void sync_to_disk(const fs::path& path, bool directory) {
+#if defined(_WIN32)
+  (void)path;
+  (void)directory;  // no portable equivalent; the Windows path is untested
+#else
+  const int flags = O_RDONLY | (directory ? O_DIRECTORY : 0);
+  const int fd = ::open(path.c_str(), flags);
+  if (fd < 0)
+    throw OutputError("cannot open '" + path.string() + "' to flush it: " + std::strerror(errno));
+  const int flushed = ::fsync(fd);
+  const int err = errno;
+  ::close(fd);
+  // Some filesystems reject fsync on a directory; that is not fatal here.
+  if (flushed != 0 && !(directory && (err == EINVAL || err == ENOTSUP)))
+    throw OutputError("cannot flush '" + path.string() + "': " + std::strerror(err));
+#endif
+}
+
+// Reads a `*.crc32` sidecar ("<8 lowercase hex digits>\n") and returns the
+// checksum; throws FormatError when the file is missing or malformed.
+uint32_t read_sidecar(const fs::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) throw FormatError("cannot open '" + path.string() + "' for reading");
+  std::string text;
+  in >> text;
+  if (text.size() != 8 || in.bad())
+    throw FormatError("'" + path.string() + "': expected 8 hex digits");
+  uint32_t value = 0;
+  const std::from_chars_result parsed =
+      std::from_chars(text.data(), text.data() + text.size(), value, 16);
+  if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size())
+    throw FormatError("'" + path.string() + "': expected 8 hex digits");
+  return value;
+}
+
+// The sidecars are small and cheap, so they are cross-checked against the
+// manifest on every load, even when the expensive data-file CRCs are skipped.
+void verify_sidecars(const fs::path& dir, const Manifest& manifest) {
+  for (const auto& [name, info] : manifest.files) {
+    const uint32_t sidecar = read_sidecar(dir / (name + kCrcSuffix));
+    if (sidecar != info.crc32)
+      throw FormatError("'" + (dir / (name + kCrcSuffix)).string() +
+                        "' disagrees with the manifest checksum of '" + name + "'");
+  }
+}
+
 void load_bitvector(BitVector& bitvector, const fs::path& bv_path, const fs::path& rb_path,
-                    uint64_t nbits, bool stored_little_endian, bool use_mmap) {
+                    uint64_t nbits, bool stored_little_endian, bool use_mmap,
+                    const LogSink& log) {
   if (use_mmap) {
     try {
       MappedFile bv_file = MappedFile::map(bv_path.string());
@@ -473,7 +524,8 @@ void load_bitvector(BitVector& bitvector, const fs::path& bv_path, const fs::pat
       bitvector.map_rank(std::move(rb_file), nbits, stored_little_endian);
       return;
     } catch (const IoError& error) {
-      std::print(stderr, "gcrank: warning: {}; falling back to reading\n", error.what());
+      // A library must not write to stderr; report through the caller's sink.
+      if (log) log(LogLevel::Warning, std::string(error.what()) + "; falling back to reading");
     }
   }
   bitvector.load_bv(bv_path.string(), nbits);
@@ -484,7 +536,27 @@ void load_bitvector(BitVector& bitvector, const fs::path& bv_path, const fs::pat
 
 // ---- GcRank ---------------------------------------------------------------
 
-GcRank::GcRank() = default;
+// The out-of-line state. Keeping it here means the public header shows only
+// GcRank, the option structs, ContigInfo, Manifest and the error types.
+struct GcRank::Impl {
+  // Transparent hash so contig() and the contig-relative queries can look up a
+  // string_view without constructing a std::string.
+  struct NameHash {
+    using is_transparent = void;
+    std::size_t operator()(std::string_view name) const {
+      return std::hash<std::string_view>{}(name);
+    }
+  };
+
+  BitVector genome_;
+  BitVector valid_;
+  std::vector<ContigInfo> contigs_;
+  std::unordered_map<std::string, std::size_t, NameHash, std::equal_to<>> contig_index_;
+  Manifest manifest_;
+  bool built_ = false;
+};
+
+GcRank::GcRank() : impl_(std::make_unique<Impl>()) {}
 GcRank::~GcRank() = default;
 GcRank::GcRank(GcRank&&) noexcept = default;
 GcRank& GcRank::operator=(GcRank&&) noexcept = default;
@@ -492,115 +564,190 @@ GcRank& GcRank::operator=(GcRank&&) noexcept = default;
 void GcRank::build(const std::string& fasta_path, const BuildOptions& options) {
   if (fasta_path.empty()) throw UsageError("build: empty FASTA path");
   if (options.chunk_bits == 0) throw UsageError("build: chunk_bits must be > 0");
-  const unsigned workers = options.threads == 0 ? 1u : options.threads;
+  const unsigned workers = options.threads == 0 ? default_threads() : options.threads;
 
-  // Source metadata first: fails fast and is the only hashing work.
-  std::error_code ec;
-  const uint64_t file_bytes = fs::file_size(fasta_path, ec);
-  if (ec) throw InputError("cannot stat '" + fasta_path + "': " + ec.message());
-  std::string digest;
-  try {
-    digest = sha256_file_hex(fasta_path);
-  } catch (const IoError& error) {
-    throw InputError(error.what());
-  }
+  // Validate SOURCE_DATE_EPOCH before parsing: it is only needed for the
+  // manifest, but a bad value should not surface after an hours-long build.
+  const std::string created = created_from_env();
 
-  genome_.clear();
-  valid_.clear();
-  contigs_.clear();
-  manifest_ = Manifest();
-  built_ = false;
+  // Open the source and hash it while parsing: one pass over the input, and no
+  // time-of-check/time-of-use window between the hash and the parse. Non-
+  // seekable sources ("-" for stdin, pipes, process substitution) work too,
+  // because nothing needs the file size up front.
+  HashingInputStream input(open_input(fasta_path));
 
   const auto started = std::chrono::steady_clock::now();
+  auto log = [&options](LogLevel level, std::string message) {
+    if (options.log) options.log(level, message);
+  };
   if (options.verbose)
-    std::print(stderr,
-               "[gcrank] building from {} ({} bytes) with {} worker thread(s), "
-               "chunk {} bases\n",
-               fasta_path, file_bytes, workers, options.chunk_bits);
+    log(LogLevel::Info,
+        std::format("building from {} with {} worker thread(s), chunk {} bases",
+                    input.name(), workers, options.chunk_bits));
 
-  BuildPipeline pipeline(fasta_path, options.chunk_bits, workers, options.verbose);
-  pipeline.run(genome_, valid_, contigs_);
+  // Build into locals and commit only on success, so a failed build leaves any
+  // loaded index usable (the strong exception guarantee).
+  BitVector genome;
+  BitVector valid;
+  std::vector<ContigInfo> contigs;
 
-  genome_.finalize();
-  valid_.finalize();
+  BuildPipeline pipeline(input, options.chunk_bits, workers, options.verbose, options.log);
+  pipeline.run(genome, valid, contigs);
 
-  manifest_.format_version = kFormatVersion;
-  manifest_.builder_version = kBuilderVersion;
-  manifest_.created = created_from_env();
-  manifest_.source.path = fasta_path;
-  manifest_.source.sha256 = digest;
-  manifest_.source.file_bytes = file_bytes;
-  manifest_.source.total_bases = genome_.size();
-  manifest_.source.num_contigs = static_cast<uint64_t>(contigs_.size());
-  manifest_.bit_order = kBitOrderMsb0;
-  manifest_.endianness = host_endianness_name();
-  manifest_.superblock_bits = kSuperblockBits;
-  manifest_.basic_block_bits = kBasicBlockBits;
-  manifest_.remove_ambiguous_supported = true;
-  manifest_.semantics = default_semantics();
-  built_ = true;
+  genome.finalize();
+  valid.finalize();
+
+  Manifest manifest;
+  manifest.format_version = kFormatVersion;
+  manifest.builder_version = kBuilderVersion;
+  manifest.created = created;
+  manifest.source.path = fasta_path;
+  manifest.source.sha256 = input.sha256_hex();
+  manifest.source.file_bytes = input.bytes();
+  manifest.source.total_bases = genome.size();
+  manifest.source.num_contigs = static_cast<uint64_t>(contigs.size());
+  manifest.bit_order = kBitOrderMsb0;
+  manifest.endianness = kEndiannessLittle;  // .rb scalars are always little-endian
+  manifest.superblock_bits = kSuperblockBits;
+  manifest.basic_block_bits = kBasicBlockBits;
+  manifest.remove_ambiguous_supported = true;
+  manifest.total_gc = genome.rank1(genome.size());
+  manifest.total_valid = valid.rank1(valid.size());
+  manifest.has_totals = true;
+  manifest.semantics = default_semantics();
+
+  const uint64_t total_gc = manifest.total_gc;
+  impl_->genome_ = std::move(genome);
+  impl_->valid_ = std::move(valid);
+  impl_->contigs_ = std::move(contigs);
+  rebuild_contig_index();
+  impl_->manifest_ = std::move(manifest);
+  impl_->built_ = true;
 
   if (options.verbose) {
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-    std::print(stderr, "[gcrank] built {} bases, {} contigs, {} GC in {:.2f}s\n",
-               manifest_.source.total_bases, manifest_.source.num_contigs,
-               genome_.rank1(genome_.size()), seconds);
+    log(LogLevel::Info,
+        std::format("built {} bases, {} contigs, {} GC in {:.2f}s",
+                    impl_->manifest_.source.total_bases, impl_->manifest_.source.num_contigs, total_gc, seconds));
   }
 }
 
 void GcRank::save(const std::string& out_dir, const std::string& name, bool overwrite) const {
-  if (!built_) throw Error("save: no index in memory (call build() or load() first)");
+  if (!impl_->built_) throw Error("save: no index in memory (call build() or load() first)");
   if (name.empty()) throw UsageError("save: index name must not be empty");
   if (name == "." || name == "..") throw UsageError("save: invalid index name '" + name + "'");
   if (name.find('/') != std::string::npos || name.find('\\') != std::string::npos)
     throw UsageError("save: index name must not contain path separators: '" + name + "'");
-  if (!genome_.has_rank() || !valid_.has_rank())
+  if (!impl_->genome_.has_rank() || !impl_->valid_.has_rank())
     throw Error("save: rank indices are not built");
 
   const fs::path out(out_dir);
   const fs::path final_dir = out / (name + ".gcrank");
-  const fs::path tmp_dir = out / (name + ".gcrank.tmp");
 
   std::error_code ec;
   fs::create_directories(out, ec);
   if (ec)
     throw OutputError("cannot create output directory '" + out.string() + "': " + ec.message());
-  if (fs::exists(final_dir, ec)) {
-    if (!overwrite)
-      throw OutputError("'" + final_dir.string() +
-                        "' already exists (pass overwrite/--overwrite to replace it)");
-    fs::remove_all(final_dir, ec);
-    if (ec) throw OutputError("cannot remove '" + final_dir.string() + "': " + ec.message());
-  }
-  if (fs::exists(tmp_dir, ec)) {
-    fs::remove_all(tmp_dir, ec);
-    if (ec) throw OutputError("cannot remove leftover '" + tmp_dir.string() + "': " + ec.message());
-  }
-  fs::create_directories(tmp_dir, ec);
-  if (ec) throw OutputError("cannot create '" + tmp_dir.string() + "': " + ec.message());
+  const bool target_exists = fs::exists(final_dir, ec);
+  if (ec)
+    throw OutputError("cannot stat '" + final_dir.string() + "': " + ec.message());
+  if (target_exists && !overwrite)
+    throw OutputError("'" + final_dir.string() +
+                      "' already exists (pass overwrite/--overwrite to replace it)");
 
+  // Unique per call, so two concurrent saves of the same index cannot delete
+  // each other's work; the creation is retried in the unlikely case that the
+  // name is already taken by a leftover from a crashed process with a reused
+  // pid, because that directory must not be reused.
+  fs::path tmp_dir;
+  bool created = false;
+  for (int attempt = 0; attempt < 8 && !created; ++attempt) {
+    tmp_dir = out / (name + ".gcrank.tmp." + unique_save_token());
+    created = fs::create_directories(tmp_dir, ec);
+    if (ec) throw OutputError("cannot create '" + tmp_dir.string() + "': " + ec.message());
+  }
+  if (!created)
+    throw OutputError("cannot create a temporary directory for '" + final_dir.string() + "'");
+  fs::path old_dir;  // named freshly on every publish attempt below
+
+  // The existing index is not touched until the new one has been written and
+  // verified: it is moved aside only just before the new directory is renamed
+  // into place, and moved back if anything fails in between.
+  bool old_moved = false;
+  bool published = false;
   try {
-    Manifest manifest = manifest_;
+    Manifest manifest = impl_->manifest_;
     if (manifest.created.empty()) manifest.created = created_from_env();
+    // .rb scalars are always little-endian, and the population totals are
+    // recomputed from the in-memory rank indices.
+    manifest.endianness = kEndiannessLittle;
+    manifest.total_gc = impl_->genome_.rank1(impl_->genome_.size());
+    manifest.total_valid = impl_->valid_.rank1(impl_->valid_.size());
+    manifest.has_totals = true;
     manifest.files.clear();
-    manifest.files[kContigsFileName] = write_contigs(tmp_dir / kContigsFileName, contigs_);
-    manifest.files[kGenomeBvFileName] = genome_.save_bv((tmp_dir / kGenomeBvFileName).string());
-    manifest.files[kGenomeRbFileName] = genome_.save_rank((tmp_dir / kGenomeRbFileName).string());
-    manifest.files[kValidBvFileName] = valid_.save_bv((tmp_dir / kValidBvFileName).string());
-    manifest.files[kValidRbFileName] = valid_.save_rank((tmp_dir / kValidRbFileName).string());
+    manifest.files[kContigsFileName] = write_contigs(tmp_dir / kContigsFileName, impl_->contigs_);
+    manifest.files[kGenomeBvFileName] = impl_->genome_.save_bv((tmp_dir / kGenomeBvFileName).string());
+    manifest.files[kGenomeRbFileName] = impl_->genome_.save_rank((tmp_dir / kGenomeRbFileName).string());
+    manifest.files[kValidBvFileName] = impl_->valid_.save_bv((tmp_dir / kValidBvFileName).string());
+    manifest.files[kValidRbFileName] = impl_->valid_.save_rank((tmp_dir / kValidRbFileName).string());
     for (const char* data_file : kDataFiles)
       write_sidecar(tmp_dir / (std::string(data_file) + kCrcSuffix),
                     manifest.files[data_file].crc32);
     manifest.save((tmp_dir / kManifestFileName).string());
     if (const std::string problem = verify_index_files(tmp_dir, manifest); !problem.empty())
       throw OutputError(problem + " after writing; the index was not published");
-    fs::rename(tmp_dir, final_dir, ec);
-    if (ec)
-      throw OutputError("cannot rename '" + tmp_dir.string() + "' to '" + final_dir.string() +
-                        "': " + ec.message());
+    for (const auto& entry : fs::directory_iterator(tmp_dir))
+      if (entry.is_regular_file()) sync_to_disk(entry.path(), false);
+    sync_to_disk(tmp_dir, true);  // the new entries themselves, too
+
+    // Publish the verified directory. With overwrite, the existing index is
+    // moved aside first and restored if the rename fails; because another
+    // process may be saving the same index concurrently, the move/publish pair
+    // is retried a few times rather than assumed to be the only writer.
+    std::error_code publish_error;
+    for (int attempt = 0; attempt < 5 && !published; ++attempt) {
+      const bool present = fs::exists(final_dir, ec);
+      if (ec)
+        throw OutputError("cannot stat '" + final_dir.string() + "': " + ec.message());
+      if (!present) {
+        fs::rename(tmp_dir, final_dir, publish_error);
+        if (!publish_error) published = true;
+        continue;  // retry when another saver published in the meantime
+      }
+      if (!overwrite)
+        throw OutputError("'" + final_dir.string() +
+                          "' already exists (pass overwrite/--overwrite to replace it)");
+      old_dir = out / (name + ".gcrank.old." + unique_save_token());
+      fs::rename(final_dir, old_dir, publish_error);
+      if (publish_error) continue;  // lost the race for the existing index; retry
+      old_moved = true;
+      fs::rename(tmp_dir, final_dir, publish_error);
+      if (!publish_error) {
+        published = true;
+        break;
+      }
+      // Undo the move and try again; keep the failure from the last attempt.
+      std::error_code ignored;
+      fs::rename(old_dir, final_dir, ignored);
+      if (!ignored) old_moved = false;
+    }
+    if (!published)
+      throw OutputError("cannot publish '" + final_dir.string() + "': " +
+                        (publish_error ? publish_error.message()
+                                       : "another process is writing the same index"));
+    sync_to_disk(out, true);  // make the rename itself durable
+    if (old_moved) {
+      std::error_code ignored;
+      fs::remove_all(old_dir, ignored);  // best effort; a leftover is harmless
+    }
   } catch (...) {
     std::error_code ignored;
+    if (old_moved && !published) {
+      // Restore the previous index. Should even this fail, the old index still
+      // exists under old_dir instead of being gone.
+      fs::rename(old_dir, final_dir, ignored);
+    }
     fs::remove_all(tmp_dir, ignored);
     throw;
   }
@@ -609,55 +756,89 @@ void GcRank::save(const std::string& out_dir, const std::string& name, bool over
 void GcRank::load(const std::string& dir, const OpenOptions& options) {
   const fs::path root(dir);
   Manifest manifest = Manifest::load((root / kManifestFileName).string());
-  std::vector<ContigInfo> contigs =
-      parse_contigs(root / kContigsFileName, manifest.source.num_contigs,
-                    manifest.source.total_bases);
+
+  // Checksums first: a corrupt index should report a checksum or sidecar
+  // mismatch, not a confusing parse error from inside a corrupted data file.
   if (options.validate_crc)
     if (const std::string problem = verify_index_files(root, manifest); !problem.empty())
       throw FormatError(problem);
+  verify_sidecars(root, manifest);
+
+  std::vector<ContigInfo> contigs =
+      parse_contigs(root / kContigsFileName, manifest.source.num_contigs,
+                    manifest.source.total_bases);
 
   const bool stored_little_endian = manifest.endianness == kEndiannessLittle;
   BitVector genome;
   BitVector valid;
   load_bitvector(genome, root / kGenomeBvFileName, root / kGenomeRbFileName,
-                 manifest.source.total_bases, stored_little_endian, options.mmap);
+                 manifest.source.total_bases, stored_little_endian, options.mmap, options.log);
   load_bitvector(valid, root / kValidBvFileName, root / kValidRbFileName,
-                 manifest.source.total_bases, stored_little_endian, options.mmap);
+                 manifest.source.total_bases, stored_little_endian, options.mmap, options.log);
 
-  genome_ = std::move(genome);
-  valid_ = std::move(valid);
-  contigs_ = std::move(contigs);
-  manifest_ = std::move(manifest);
-  built_ = true;
+  // Cheap structural cross-check: a corrupt rank index changes the end-of-vector
+  // rank, which must equal the totals stored in the manifest. This catches it
+  // even when validate_crc is false.
+  if (manifest.has_totals) {
+    if (genome.rank1(genome.size()) != manifest.total_gc ||
+        valid.rank1(valid.size()) != manifest.total_valid)
+      throw FormatError(root.string() +
+                        ": rank indices disagree with the manifest population counts");
+  }
+
+  impl_->genome_ = std::move(genome);
+  impl_->valid_ = std::move(valid);
+  impl_->contigs_ = std::move(contigs);
+  rebuild_contig_index();
+  impl_->manifest_ = std::move(manifest);
+  impl_->built_ = true;
+}
+
+void GcRank::rebuild_contig_index() {
+  impl_->contig_index_.clear();
+  impl_->contig_index_.reserve(impl_->contigs_.size());
+  for (std::size_t i = 0; i < impl_->contigs_.size(); ++i)
+    impl_->contig_index_.emplace(impl_->contigs_[i].name, i);
 }
 
 void GcRank::check_range(uint64_t start, uint64_t end) const {
-  if (!built_) throw Error("no index in memory (call build() or load() first)");
+  if (!impl_->built_) throw UsageError("no index in memory (call build() or load() first)");
   if (start > end)
     throw QueryError("invalid window [" + std::to_string(start) + ", " + std::to_string(end) +
                      "): start > end");
-  if (end > genome_.size())
+  if (end > impl_->genome_.size())
     throw QueryError("invalid window [" + std::to_string(start) + ", " + std::to_string(end) +
-                     "): end exceeds the genome length " + std::to_string(genome_.size()));
+                     "): end exceeds the genome length " + std::to_string(impl_->genome_.size()));
 }
 
 uint64_t GcRank::gc_count(uint64_t start, uint64_t end) const {
   check_range(start, end);
-  return genome_.rank1(end) - genome_.rank1(start);
+  return impl_->genome_.rank1(end) - impl_->genome_.rank1(start);
+}
+
+uint64_t GcRank::gc_count(std::string_view contig_name, uint64_t start, uint64_t end) const {
+  const auto [begin, finish] = resolve_window(contig_name, start, end);
+  return impl_->genome_.rank1(finish) - impl_->genome_.rank1(begin);
 }
 
 uint64_t GcRank::valid_count(uint64_t start, uint64_t end) const {
   check_range(start, end);
-  return valid_.rank1(end) - valid_.rank1(start);
+  return impl_->valid_.rank1(end) - impl_->valid_.rank1(start);
 }
 
-double GcRank::gc_fraction(uint64_t start, uint64_t end, bool remove_ambiguous) const {
-  check_range(start, end);
-  const uint64_t gc = gc_count(start, end);
+uint64_t GcRank::valid_count(std::string_view contig_name, uint64_t start, uint64_t end) const {
+  const auto [begin, finish] = resolve_window(contig_name, start, end);
+  return impl_->valid_.rank1(finish) - impl_->valid_.rank1(begin);
+}
+
+// Shared by both gc_fraction overloads; the window is already validated (but
+// may still be degenerate), so this only rejects a zero denominator.
+double GcRank::fraction(uint64_t start, uint64_t end, bool remove_ambiguous) const {
+  const uint64_t gc = impl_->genome_.rank1(end) - impl_->genome_.rank1(start);
   const uint64_t length = end - start;
   uint64_t denominator = length;
   if (remove_ambiguous) {
-    denominator = valid_count(start, end);
+    denominator = impl_->valid_.rank1(end) - impl_->valid_.rank1(start);
     if (denominator == 0)
       throw QueryError("gc_fraction(remove_ambiguous = true): window [" +
                        std::to_string(start) + ", " + std::to_string(end) +
@@ -673,18 +854,41 @@ double GcRank::gc_fraction(uint64_t start, uint64_t end, bool remove_ambiguous) 
   return static_cast<double>(quotient);
 }
 
-uint64_t GcRank::total_bases() const { return genome_.size(); }
+double GcRank::gc_fraction(uint64_t start, uint64_t end, bool remove_ambiguous) const {
+  check_range(start, end);
+  return fraction(start, end, remove_ambiguous);
+}
 
-const std::vector<ContigInfo>& GcRank::contigs() const { return contigs_; }
+double GcRank::gc_fraction(std::string_view contig_name, uint64_t start, uint64_t end,
+                           bool remove_ambiguous) const {
+  const auto [begin, finish] = resolve_window(contig_name, start, end);
+  return fraction(begin, finish, remove_ambiguous);
+}
 
-const Manifest& GcRank::manifest() const { return manifest_; }
+uint64_t GcRank::total_bases() const { return impl_->genome_.size(); }
+
+const std::vector<ContigInfo>& GcRank::contigs() const { return impl_->contigs_; }
+
+const Manifest& GcRank::manifest() const { return impl_->manifest_; }
 
 const ContigInfo* GcRank::contig(std::string_view name) const {
-  const auto found =
-      std::ranges::find_if(contigs_, [name](const ContigInfo& contig) {
-        return contig.name == name;
-      });
-  return found == contigs_.end() ? nullptr : &*found;
+  const auto found = impl_->contig_index_.find(name);
+  return found == impl_->contig_index_.end() ? nullptr : &impl_->contigs_[found->second];
+}
+
+std::pair<uint64_t, uint64_t> GcRank::resolve_window(std::string_view name, uint64_t start,
+                                                     uint64_t end) const {
+  if (!impl_->built_) throw UsageError("no index in memory (call build() or load() first)");
+  const ContigInfo* info = contig(name);
+  if (info == nullptr) throw QueryError("unknown contig '" + std::string(name) + "'");
+  if (start > end)
+    throw QueryError("invalid window on contig '" + std::string(name) + "' [" +
+                     std::to_string(start) + ", " + std::to_string(end) + "): start > end");
+  if (end > info->length)
+    throw QueryError("invalid window on contig '" + std::string(name) + "' [" +
+                     std::to_string(start) + ", " + std::to_string(end) +
+                     "): end exceeds the contig length " + std::to_string(info->length));
+  return {info->offset + start, info->offset + end};
 }
 
 }  // namespace gcrank

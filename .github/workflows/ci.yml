@@ -13,7 +13,8 @@ concurrency:
 jobs:
   release:
     name: Release (${{ matrix.name }})
-    # Pinned: the C++23 code needs GCC 14+, which ubuntu-24.04 provides.
+    # Pinned: the C++23 code needs GCC 14+, which ubuntu-24.04 provides. The
+    # build treats warnings as errors here.
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -25,18 +26,41 @@ jobs:
             shared: ON
     steps:
       - uses: actions/checkout@v4
-      - name: Install GCC 14 and zlib
-        run: sudo apt-get update && sudo apt-get install -y g++-14 zlib1g-dev
+      - name: Install GCC 14, zlib and bedtools
+        run: sudo apt-get update && sudo apt-get install -y g++-14 zlib1g-dev bedtools
       - name: Configure
         run: >-
           cmake -S . -B build
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_CXX_COMPILER=g++-14
+          -DCMAKE_CXX_FLAGS="-Werror"
           -DBUILD_SHARED_LIBS=${{ matrix.shared }}
       - name: Build
         run: cmake --build build -j
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+  clang:
+    name: Clang 18 + libstdc++ 14
+    # The library targets the standard library that ships with GCC 14; point
+    # Clang at it explicitly (Ubuntu's default libstdc++ is 13).
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Clang 18, libstdc++ 14, zlib and bedtools
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          clang-18 libstdc++-14-dev zlib1g-dev bedtools
+      - name: Configure
+        run: >-
+          cmake -S . -B build-clang
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_COMPILER=clang++-18
+          -DCMAKE_CXX_FLAGS="--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14 -Werror"
+      - name: Build
+        run: cmake --build build-clang -j
+      - name: Test
+        run: ctest --test-dir build-clang --output-on-failure
 
   asan-ubsan:
     name: ASan + UBSan
@@ -72,3 +96,14 @@ jobs:
         run: cmake --build build-tsan -j
       - name: Test
         run: ctest --test-dir build-tsan --output-on-failure
+
+  # Deliberately absent:
+  #
+  # * macOS: AppleClang's libc++ does not implement <format> yet, which the
+  #   library and the CLI use for all formatted output. The code is portable
+  #   (no POSIX-only calls outside the split/rename/fsync path), but the job
+  #   cannot build until the toolchain ships std::format.
+  # * Big-endian: writers store .rb scalars little-endian on every host, so
+  #   readers on little-endian machines never swap. The byte-swapped read paths
+  #   (load_rank/map_rank for an index stored in the opposite byte order) are
+  #   covered by unit tests that run on every host; see tests/test_bitvector.cpp.

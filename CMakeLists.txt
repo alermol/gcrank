@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(gcrank
-  VERSION 2.0.0
+  VERSION 0.1.0
   DESCRIPTION "Standalone C++23 library and CLI for O(1) GC-content queries"
   LANGUAGES CXX)
 
@@ -41,7 +41,8 @@ add_library(gcrank
   src/thread_pool.cpp)
 add_library(gcrank::gcrank ALIAS gcrank)
 
-target_compile_features(gcrank PUBLIC cxx_std_23)
+target_compile_features(gcrank PUBLIC cxx_std_20)
+target_compile_features(gcrank PRIVATE cxx_std_23)
 target_include_directories(gcrank PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
@@ -51,9 +52,15 @@ set_target_properties(gcrank PROPERTIES
   VERSION ${PROJECT_VERSION}
   SOVERSION ${PROJECT_VERSION_MAJOR})
 
+# --- sanitizer plumbing ------------------------------------------------------
+# ThreadSanitizer flags are applied PRIVATE to every target of this project, so
+# they can never leak into the installed CMake export (a consumer must not be
+# forced to link the sanitizer runtime).
+set(GCRANK_TSAN_COMPILE_OPTIONS "")
+set(GCRANK_TSAN_LINK_OPTIONS "")
 if(GCRANK_TSAN)
-  target_compile_options(gcrank PUBLIC -fsanitize=thread -g -O1)
-  target_link_options(gcrank PUBLIC -fsanitize=thread)
+  set(GCRANK_TSAN_COMPILE_OPTIONS -fsanitize=thread -g -O1)
+  set(GCRANK_TSAN_LINK_OPTIONS -fsanitize=thread)
 endif()
 
 # Warning flags shared by the library, the CLI and the tests.
@@ -63,12 +70,33 @@ else()
   set(GCRANK_WARNING_FLAGS -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 endif()
 
-target_compile_options(gcrank PRIVATE ${GCRANK_WARNING_FLAGS})
+target_compile_options(gcrank PRIVATE ${GCRANK_WARNING_FLAGS} ${GCRANK_TSAN_COMPILE_OPTIONS})
+if(GCRANK_TSAN)
+  target_link_options(gcrank PRIVATE ${GCRANK_TSAN_LINK_OPTIONS})
+endif()
 
 if(GCRANK_BUILD_CLI)
   add_executable(gcrank-build cli/gcrank_build.cpp)
-  target_compile_options(gcrank-build PRIVATE ${GCRANK_WARNING_FLAGS})
+  target_compile_options(gcrank-build PRIVATE
+    ${GCRANK_WARNING_FLAGS} ${GCRANK_TSAN_COMPILE_OPTIONS})
+  target_link_options(gcrank-build PRIVATE ${GCRANK_TSAN_LINK_OPTIONS})
   target_link_libraries(gcrank-build PRIVATE gcrank)
+
+  add_executable(gcrank-query cli/gcrank_query.cpp)
+  target_compile_options(gcrank-query PRIVATE
+    ${GCRANK_WARNING_FLAGS} ${GCRANK_TSAN_COMPILE_OPTIONS})
+  target_link_options(gcrank-query PRIVATE ${GCRANK_TSAN_LINK_OPTIONS})
+  target_link_libraries(gcrank-query PRIVATE gcrank)
+endif()
+
+if(GCRANK_BUILD_TESTS)
+  # Compiles the library example from README.md so the documentation cannot
+  # drift away from the API (see examples/readme.cpp).
+  add_executable(gcrank-example-readme examples/readme.cpp)
+  target_compile_options(gcrank-example-readme PRIVATE
+    ${GCRANK_WARNING_FLAGS} ${GCRANK_TSAN_COMPILE_OPTIONS})
+  target_link_options(gcrank-example-readme PRIVATE ${GCRANK_TSAN_LINK_OPTIONS})
+  target_link_libraries(gcrank-example-readme PRIVATE gcrank)
 endif()
 
 if(GCRANK_BUILD_TESTS)
@@ -85,10 +113,16 @@ install(TARGETS gcrank EXPORT gcrankTargets
   INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 if(GCRANK_BUILD_CLI)
-  install(TARGETS gcrank-build RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS gcrank-build gcrank-query RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
-install(DIRECTORY include/gcrank DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+# Only the public headers are installed; everything under detail/ is internal.
+install(FILES
+  include/gcrank/error.h
+  include/gcrank/format.h
+  include/gcrank/gc_rank.h
+  include/gcrank/manifest.h
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/gcrank)
 
 set(GCRANK_CMAKE_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/gcrank)
 configure_package_config_file(

@@ -1,5 +1,5 @@
 {
-  "builder_version": "2.0.0",
+  "builder_version": "0.1.0",
   "created": "2023-11-14T22:13:20Z",
   "files": {
     "contigs.tsv": {
@@ -23,13 +23,15 @@
       "size": 80
     }
   },
-  "format_version": "1.0.0",
+  "format_version": "0.1.0",
   "index": {
     "basic_block_bits": 512,
     "bit_order": "msb0",
     "endianness": "little",
     "remove_ambiguous_supported": true,
-    "superblock_bits": 4096
+    "superblock_bits": 4096,
+    "total_gc": 5405,
+    "total_valid": 10932
   },
   "semantics": {
     "ambiguous_bases": "N, R, Y, S, W, K, M, B, D, H, V: never GC and never valid; removed from the denominator by gc_fraction(remove_ambiguous = true)",

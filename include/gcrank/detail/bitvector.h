@@ -2,9 +2,9 @@
 //
 // Bitvector with a two-level rank index.
 //
-// Bit i lives in word i/64 at bit position (63 - i%64): the on-disk byte
-// stream is grouped into 64-bit words little-endian byte first, so the very
-// first byte of the stream occupies the most significant byte of word 0.
+// Bit i lives in word i/64 at bit position (63 - i%64): the file is a stream
+// of 64-bit little-endian words, so the last byte of each 8-byte group holds
+// the most significant bits of its word.
 //
 // Rank index (per bitvector):
 //   superblock = 4096 bits, sb_rank[i] = absolute rank at i*4096   (uint64)
@@ -22,14 +22,9 @@
 
 #include "gcrank/error.h"
 #include "gcrank/format.h"
-#include "gcrank/input_stream.h"
+#include "gcrank/detail/input_stream.h"
 
 namespace gcrank {
-
-// Portable population count.
-inline int popcount64(uint64_t x) {
-  return std::popcount(x);  // lowers to POPCNT when the target has it
-}
 
 // Returns a mask with the top `n` bits set (n <= 64).
 inline constexpr uint64_t mask_high_bits(unsigned n) {
@@ -85,7 +80,8 @@ public:
   // returns its size and the CRC-32 of the bytes as written.
   FileInfo save_bv(const std::string& path) const;
 
-  // Writes the .rb file in host byte order (recorded in the manifest).
+  // Writes the .rb file, always little-endian (the manifest records the byte
+  // order, so readers on big-endian hosts swap).
   FileInfo save_rank(const std::string& path) const;
 
   // Loads a .bv / .rb file into heap storage. `nbits` is the logical size.
@@ -98,7 +94,8 @@ public:
   void map_bv(MappedFile file, uint64_t nbits);
   void map_rank(MappedFile file, uint64_t nbits, bool stored_little_endian);
 
-  // True when the data was mapped rather than read into heap memory.
+  // True when at least part of the data is a view into a mapped file rather
+  // than heap storage (a big-endian host materializes even mapped input).
   bool is_mapped() const { return mapped_; }
 
 private:

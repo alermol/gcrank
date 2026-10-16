@@ -4,15 +4,22 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
-#include "gcrank/crc32.h"
+#if defined(__linux__) || defined(__APPLE__)
+#include <unistd.h>
+#endif
+
+#include "gcrank/detail/crc32.h"
 #include "gcrank/error.h"
 #include "gcrank/format.h"
 #include "gcrank/gc_rank.h"
 #include "gcrank/manifest.h"
-#include "gcrank/sha256.h"
+#include "gcrank/detail/sha256.h"
 #include "test_util.h"
 
 using namespace gcrank;
@@ -142,8 +149,13 @@ TEST_CASE("roundtrip: gzip and plain builds produce identical data files") {
     CAPTURE(name);
     CHECK(gctest::same_bytes(plain_dir / name, gzip_dir / name));
   }
-  // The manifest differs only in the recorded source.
-  CHECK(from_plain.manifest().source.sha256 != from_gzip.manifest().source.sha256);
+  // The manifest differs only in the recorded source: the hash covers the
+  // parsed byte stream, so a file and its gzip form hash identically (and the
+  // recorded size is the decompressed size).
+  CHECK(from_plain.manifest().source.sha256 == from_gzip.manifest().source.sha256);
+  CHECK(from_plain.manifest().source.file_bytes == from_gzip.manifest().source.file_bytes);
+  CHECK(from_gzip.manifest().source.file_bytes ==
+        fs::file_size(gctest::data_file("test_small.fa")));
   CHECK(from_plain.total_bases() == from_gzip.total_bases());
   CHECK(from_plain.gc_count(0, from_plain.total_bases()) ==
         from_gzip.gc_count(0, from_gzip.total_bases()));
@@ -181,7 +193,11 @@ TEST_CASE("roundtrip: the golden manifest describes the index completely") {
   CHECK(manifest.source.num_contigs == index.contigs().size());
   CHECK(manifest.source.total_bases == index.total_bases());
   CHECK(manifest.bit_order == "msb0");
-  CHECK(manifest.endianness == host_endianness_name());
+  // 1.1 writers store .rb scalars little-endian on every host.
+  CHECK(manifest.endianness == kEndiannessLittle);
+  CHECK(manifest.has_totals);
+  CHECK(manifest.total_gc == index.gc_count(0, index.total_bases()));
+  CHECK(manifest.total_valid == index.valid_count(0, index.total_bases()));
   CHECK(manifest.superblock_bits == 4096);
   CHECK(manifest.basic_block_bits == 512);
   CHECK(manifest.remove_ambiguous_supported);
@@ -327,7 +343,7 @@ TEST_CASE("roundtrip: remove_ambiguous is the classic denominator for A/C/G/T/N 
   gctest::write_text(fasta, ">acgtn\n" + sequence + "\n");
 
   GcRank index;
-  index.build(fasta.string(), BuildOptions{97, 2, false});
+  index.build(fasta.string(), BuildOptions{97, 2, false, {}});
 
   const gctest::NaiveFasta reference = gctest::parse_fasta_plain(fasta);
   const uint64_t total = index.total_bases();
@@ -371,7 +387,7 @@ TEST_CASE("roundtrip: gc_fraction is computed like bedtools nuc (single precisio
   gctest::write_text(fasta, ">w\n" + sequence + "\n");
 
   GcRank index;
-  index.build(fasta.string(), BuildOptions{100000, 2, false});
+  index.build(fasta.string(), BuildOptions{100000, 2, false, {}});
   REQUIRE(index.total_bases() == length);
   REQUIRE(index.gc_count(0, length) == gc);
 
@@ -439,21 +455,21 @@ TEST_CASE("roundtrip: corrupted and incomplete indexes are rejected on load") {
     REQUIRE(!bytes.empty());
     bytes[0] ^= 0xFF;
     gctest::write_text(dir / kGenomeBvFileName, std::string(bytes.begin(), bytes.end()));
-    expect_format_error(dir, OpenOptions{true, false});
+    expect_format_error(dir, OpenOptions{true, false, {}});
     // ... but an unchecked load accepts it.
     GcRank unchecked;
-    CHECK_NOTHROW(unchecked.load(dir.string(), OpenOptions{false, false}));
+    CHECK_NOTHROW(unchecked.load(dir.string(), OpenOptions{false, false, {}}));
   }
   {  // A truncated contigs.tsv.
     const fs::path dir = copy_golden("short_contigs");
     const std::string text = gctest::read_text(dir / kContigsFileName);
     gctest::write_text(dir / kContigsFileName, text.substr(0, text.size() / 2));
-    expect_format_error(dir, OpenOptions{true, false});
+    expect_format_error(dir, OpenOptions{true, false, {}});
   }
   {  // A missing data file.
     const fs::path dir = copy_golden("missing_valid");
     fs::remove(dir / kValidRbFileName);
-    expect_format_error(dir, OpenOptions{true, false});
+    expect_format_error(dir, OpenOptions{true, false, {}});
   }
   {  // A missing manifest.
     GcRank index;
@@ -465,18 +481,18 @@ TEST_CASE("roundtrip: corrupted and incomplete indexes are rejected on load") {
     const std::string needle = "\"format_version\": \"" + std::string(kFormatVersion) + "\"";
     const std::size_t position = text.find(needle);
     REQUIRE(position != std::string::npos);
-    text.replace(position, needle.size(), "\"format_version\": \"2.0.0\"");
+    text.replace(position, needle.size(), "\"format_version\": \"9.0.0\"");
     gctest::write_text(dir / kManifestFileName, text);
-    expect_format_error(dir, OpenOptions{true, false});
+    expect_format_error(dir, OpenOptions{true, false, {}});
   }
-  {  // contigs.tsv whose lengths no longer add up.
+  {  // contigs.tsv whose lengths do not add up.
     const fs::path dir = copy_golden("bad_offsets");
     std::string text = gctest::read_text(dir / kContigsFileName);
     const std::size_t position = text.find("\t100\t0\n");
     REQUIRE(position != std::string::npos);
     text.replace(position, 8, "\t99\t0\n");
     gctest::write_text(dir / kContigsFileName, text);
-    expect_format_error(dir, OpenOptions{true, false});
+    expect_format_error(dir, OpenOptions{true, false, {}});
   }
 }
 
@@ -487,7 +503,7 @@ TEST_CASE("roundtrip: build and save failures are typed") {
   GcRank index;
   CHECK_THROWS_AS(index.build(tmp.file("absent.fa").string()), InputError);
   CHECK_THROWS_AS(index.build(gctest::data_file("test_small.fa").string(),
-                              BuildOptions{0, 1, false}),
+                              BuildOptions{0, 1, false, {}}),
                   UsageError);
 
   const fs::path broken = tmp.file("broken.fa");
@@ -510,4 +526,294 @@ TEST_CASE("roundtrip: build and save failures are typed") {
   const fs::path blocker = tmp.file("blocker");
   gctest::write_text(blocker, "x");
   CHECK_THROWS_AS(index.save((blocker / "out").string(), "small"), OutputError);
+}
+
+TEST_CASE("roundtrip: a failed overwrite keeps the old index") {
+  gctest::TempDir tmp("overwrite-failure");
+  const gctest::EnvGuard epoch("SOURCE_DATE_EPOCH", kGoldenEpoch);
+
+  GcRank index;
+  index.build(gctest::data_file("test_small.fa").string());
+  const fs::path out = tmp.file("out");
+  index.save(out.string(), "small");
+  const fs::path index_dir = out / "small.gcrank";
+  REQUIRE(fs::exists(index_dir / kManifestFileName));
+  const std::vector<uint8_t> manifest_before =
+      gctest::read_bytes(index_dir / kManifestFileName);
+  const std::vector<uint8_t> genome_before = gctest::read_bytes(index_dir / kGenomeBvFileName);
+
+#if defined(__linux__) || defined(__APPLE__)
+  // Only meaningful as a non-root user: root bypasses directory permissions.
+  if (::geteuid() != 0) {
+    fs::permissions(out, fs::perms::owner_read | fs::perms::owner_exec);
+    CHECK_THROWS_AS(index.save(out.string(), "small", /*overwrite=*/true), OutputError);
+    fs::permissions(out, fs::perms::owner_all, fs::perm_options::replace);
+    CHECK(gctest::read_bytes(index_dir / kManifestFileName) == manifest_before);
+    CHECK(gctest::read_bytes(index_dir / kGenomeBvFileName) == genome_before);
+    GcRank reloaded;
+    CHECK_NOTHROW(reloaded.load(index_dir.string()));
+    CHECK(reloaded.total_bases() == index.total_bases());
+  }
+#endif
+}
+
+TEST_CASE("roundtrip: concurrent saves of the same name do not corrupt each other") {
+  gctest::TempDir tmp("concurrent-save");
+  const gctest::EnvGuard epoch("SOURCE_DATE_EPOCH", kGoldenEpoch);
+
+  GcRank index;
+  BuildOptions options;
+  options.threads = 2;
+  index.build(gctest::data_file("test_small.fa").string(), options);
+  index.save(tmp.path().string(), "ref");  // reference bytes for the same data
+
+  std::exception_ptr first_error;
+  std::exception_ptr second_error;
+  {
+    std::thread a([&] {
+      try {
+        index.save(tmp.path().string(), "same", /*overwrite=*/true);
+      } catch (...) {
+        first_error = std::current_exception();
+      }
+    });
+    std::thread b([&] {
+      try {
+        index.save(tmp.path().string(), "same", /*overwrite=*/true);
+      } catch (...) {
+        second_error = std::current_exception();
+      }
+    });
+    a.join();
+    b.join();
+  }
+  if (first_error != nullptr || second_error != nullptr) {
+    try {
+      std::rethrow_exception(first_error != nullptr ? first_error : second_error);
+    } catch (const std::exception& error) {
+      FAIL("concurrent save threw: " << error.what());
+    } catch (...) {
+      FAIL("concurrent save threw a non-standard exception");
+    }
+  }
+  CHECK(gctest::diff_dirs(tmp.file("same.gcrank").string(),
+                          tmp.file("ref.gcrank").string())
+            .empty());
+  for (const auto& entry : fs::directory_iterator(tmp.path())) {
+    CAPTURE(entry.path().string());
+    const std::string name = entry.path().filename().string();
+    CHECK(name.find(".tmp.") == std::string::npos);
+    CHECK(name.find(".old.") == std::string::npos);
+  }
+}
+
+TEST_CASE("roundtrip: SOURCE_DATE_EPOCH is validated before the input is read") {
+  gctest::TempDir tmp("bad-epoch");
+  const gctest::EnvGuard epoch("SOURCE_DATE_EPOCH", "not-an-epoch");
+  GcRank index;
+  // The input does not exist, so an InputError would be the natural failure;
+  // the invalid epoch must win so that a multi-hour build cannot fail on it at
+  // the very end.
+  CHECK_THROWS_AS(index.build(tmp.file("absent.fa").string()), UsageError);
+}
+
+TEST_CASE("roundtrip: contig-relative queries match the global ones and reject crossings") {
+  gctest::TempDir tmp("contig-relative");
+  const gctest::EnvGuard epoch("SOURCE_DATE_EPOCH", kGoldenEpoch);
+  GcRank index;
+  index.build(gctest::data_file("test_small.fa").string());
+
+  for (const gctest::ExpectedTotals& row : gctest::load_expected_totals()) {
+    if (!row.scope.starts_with("contig:")) continue;
+    const std::string name = row.scope.substr(std::string_view("contig:").size());
+    CAPTURE(name);
+    const ContigInfo* info = index.contig(name);
+    REQUIRE(info != nullptr);
+    CHECK(info->length == row.length);
+    CHECK(index.gc_count(name, 0, info->length) == row.gc_count);
+    CHECK(index.valid_count(name, 0, info->length) == row.valid_count);
+    CHECK(index.gc_count(name, 0, info->length) ==
+          index.gc_count(info->offset, info->offset + info->length));
+    if (info->length >= 4) {
+      const uint64_t begin = info->length / 3;
+      const uint64_t end = info->length - 2;
+      CHECK(index.gc_count(name, begin, end) ==
+            index.gc_count(info->offset + begin, info->offset + end));
+      CHECK(index.valid_count(name, begin, end) ==
+            index.valid_count(info->offset + begin, info->offset + end));
+      CHECK(index.gc_fraction(name, begin, end, false) ==
+            index.gc_fraction(info->offset + begin, info->offset + end, false));
+    }
+  }
+
+  // The classic misuse: a BED interval that runs past the contig end must fail
+  // instead of silently continuing into the next contig.
+  const ContigInfo& first = index.contigs().front();
+  CHECK_THROWS_AS(static_cast<void>(index.gc_count(first.name, 0, first.length + 1)), QueryError);
+  CHECK_THROWS_AS(static_cast<void>(index.valid_count(first.name, first.length, first.length + 1)),
+                  QueryError);
+  CHECK_THROWS_AS(static_cast<void>(index.gc_fraction(first.name, 5, 4)), QueryError);
+  CHECK_THROWS_AS(static_cast<void>(index.gc_count(std::string_view("not_a_contig"), 0, 1)),
+                  QueryError);
+  CHECK(index.gc_count(first.name, 0, 0) == 0);
+  CHECK_THROWS_AS(static_cast<void>(index.gc_fraction(first.name, 0, 0)), QueryError);
+
+  // contig() is an exact match (no prefix or suffix hits).
+  CHECK(index.contig("chr_boundary_100") != nullptr);
+  CHECK(index.contig("chr_boundary") == nullptr);
+  CHECK(index.contig("chr_boundary_100x") == nullptr);
+  CHECK(index.contig("") == nullptr);
+
+  // An empty contig is a valid name with length 0.
+  const fs::path empty_contig_fasta = tmp.file("empty_contig.fa");
+  gctest::write_text(empty_contig_fasta, ">empty\n>a\nACGT\n");
+  GcRank with_empty;
+  with_empty.build(empty_contig_fasta.string());
+  REQUIRE(with_empty.contig("empty") != nullptr);
+  CHECK(with_empty.contig("empty")->length == 0);
+  CHECK(with_empty.gc_count("empty", 0, 0) == 0);
+  CHECK_THROWS_AS(static_cast<void>(with_empty.gc_count("empty", 0, 1)), QueryError);
+
+  // Queries on an index that was never built or loaded are usage errors.
+  GcRank fresh;
+  CHECK_THROWS_AS(static_cast<void>(fresh.gc_count(0, 1)), UsageError);
+  CHECK_THROWS_AS(static_cast<void>(fresh.gc_count("chr1", 0, 1)), UsageError);
+  CHECK(fresh.contig("chr1") == nullptr);
+}
+
+TEST_CASE("roundtrip: a failed build leaves the previous index usable") {
+  gctest::TempDir tmp("strong-guarantee");
+  const gctest::EnvGuard epoch("SOURCE_DATE_EPOCH", kGoldenEpoch);
+  GcRank index;
+  index.build(gctest::data_file("test_small.fa").string());
+  const uint64_t total = index.total_bases();
+  const uint64_t gc = index.gc_count(0, total);
+  const std::size_t contigs = index.contigs().size();
+  REQUIRE(index.contig("chr_n_rich") != nullptr);
+
+  const fs::path broken = tmp.file("broken.fa");
+  gctest::write_text(broken, ">a\nACGT?\n");
+  CHECK_THROWS_AS(index.build(broken.string()), InputError);
+  CHECK_THROWS_AS(index.build(tmp.file("absent.fa").string()), InputError);
+
+  // The loaded index survived both failures intact.
+  CHECK(index.total_bases() == total);
+  CHECK(index.gc_count(0, total) == gc);
+  CHECK(index.contigs().size() == contigs);
+  CHECK(index.contig("chr_n_rich") != nullptr);
+  CHECK_NOTHROW(index.save(tmp.path().string(), "still_here"));
+}
+
+TEST_CASE("roundtrip: corruption is caught without full checksum validation") {
+  gctest::TempDir tmp("structural-checks");
+  const fs::path golden = gctest::data_file("test_small.gcrank");
+  const auto copy_golden = [&](const std::string& name) {
+    const fs::path target = tmp.file(name);
+    fs::remove_all(target);
+    fs::copy(golden, target, fs::copy_options::recursive);
+    return target;
+  };
+  constexpr uint64_t kGoldenBits = 11395;
+  constexpr bool kNoCrc = false;
+  constexpr bool kNoMmap = false;
+
+  {  // A tampered sidecar is rejected even when the data CRCs are skipped.
+    const fs::path dir = copy_golden("sidecar");
+    gctest::write_text(dir / (std::string(kGenomeBvFileName) + kCrcSuffix), "00000000\n");
+    GcRank index;
+    CHECK_THROWS_AS(index.load(dir.string(), OpenOptions{kNoCrc, kNoMmap, {}}), FormatError);
+  }
+  {  // A corrupted rank index (a used superblock rank bumped) changes the
+     // population total and is rejected through the manifest cross-check.
+    const fs::path dir = copy_golden("rank_total");
+    std::vector<uint8_t> bytes = gctest::read_bytes(dir / kGenomeRbFileName);
+    const uint64_t nsb = rank_superblock_entries(kGoldenBits);
+    REQUIRE(bytes.size() == rank_bytes(kGoldenBits));
+    // The last used entry is nsb - 2; the trailing one is padding for
+    // positions past the end of the vector and is never read by rank1().
+    const std::size_t at = static_cast<std::size_t>((nsb - 2) * 8);
+    uint64_t value = 0;
+    for (int b = 0; b < 8; ++b) value |= uint64_t(bytes[at + static_cast<std::size_t>(b)]) << (8 * b);
+    value += 1;
+    for (int b = 0; b < 8; ++b)
+      bytes[at + static_cast<std::size_t>(b)] = static_cast<uint8_t>((value >> (8 * b)) & 0xFFu);
+    gctest::write_text(dir / kGenomeRbFileName, std::string(bytes.begin(), bytes.end()));
+    GcRank index;
+    CHECK_THROWS_AS(index.load(dir.string(), OpenOptions{kNoCrc, kNoMmap, {}}), FormatError);
+  }
+  {  // A basic-block entry that does not restart at a superblock boundary is
+     // rejected by the rank validator itself.
+    const fs::path dir = copy_golden("rank_bb");
+    std::vector<uint8_t> bytes = gctest::read_bytes(dir / kGenomeRbFileName);
+    const uint64_t nsb = rank_superblock_entries(kGoldenBits);
+    const std::size_t at = static_cast<std::size_t>(8 * nsb + 2 * 8);  // bit 4096
+    REQUIRE(at + 1 < bytes.size());
+    bytes[at] = 1;
+    bytes[at + 1] = 0;
+    gctest::write_text(dir / kGenomeRbFileName, std::string(bytes.begin(), bytes.end()));
+    GcRank index;
+    CHECK_THROWS_AS(index.load(dir.string(), OpenOptions{kNoCrc, kNoMmap, {}}), FormatError);
+  }
+  {  // A manifest without the optional population totals still loads.
+    const fs::path dir = copy_golden("no_totals");
+    Manifest manifest = Manifest::load((dir / kManifestFileName).string());
+    manifest.has_totals = false;
+    gctest::write_text(dir / kManifestFileName, manifest.to_json());
+    GcRank index;
+    CHECK_NOTHROW(index.load(dir.string()));
+    CHECK_FALSE(index.manifest().has_totals);
+    CHECK(index.gc_count(0, index.total_bases()) > 0);
+  }
+}
+
+TEST_CASE("roundtrip: the library logs through the caller's sink, never stderr") {
+  gctest::TempDir tmp("logging");
+  const gctest::EnvGuard epoch("SOURCE_DATE_EPOCH", kGoldenEpoch);
+
+  std::mutex mutex;
+  std::vector<std::pair<LogLevel, std::string>> messages;
+  const LogSink sink = [&](LogLevel level, std::string_view message) {
+    std::lock_guard<std::mutex> lock(mutex);
+    messages.emplace_back(level, std::string(message));
+  };
+  const auto take_messages = [&] {
+    std::lock_guard<std::mutex> lock(mutex);
+    return messages;
+  };
+
+  GcRank index;
+  BuildOptions options;
+  options.verbose = true;
+  options.log = sink;
+  index.build(gctest::data_file("test_small.fa").string(), options);
+  {
+    const auto taken = take_messages();
+    REQUIRE(!taken.empty());
+    CHECK(taken.front().first == LogLevel::Info);
+    CHECK(taken.front().second.find("building from") != std::string::npos);
+    CHECK(taken.back().first == LogLevel::Info);
+    CHECK(taken.back().second.find("built") != std::string::npos);
+  }
+
+  // Without verbose the sink only ever sees warnings.
+  messages.clear();
+  options.verbose = false;
+  index.build(gctest::data_file("test_small.fa").string(), options);
+  for (const auto& entry : take_messages()) CHECK(entry.first != LogLevel::Info);
+
+  // The mmap fallback is reported as a warning (and the load fails on the
+  // missing file afterwards, which is fine: the warning is the subject here).
+  const fs::path dir = tmp.file("idx.gcrank");
+  index.save(tmp.path().string(), "idx");
+  fs::remove(dir / kValidBvFileName);
+  messages.clear();
+  OpenOptions open;
+  open.validate_crc = false;  // reach the mmap path; the CRC pass would fail first
+  open.mmap = true;
+  open.log = sink;
+  GcRank broken;
+  CHECK_THROWS_AS(broken.load(dir.string(), open), IoError);
+  bool warned = false;
+  for (const auto& entry : take_messages()) warned |= entry.first == LogLevel::Warning;
+  CHECK(warned);
 }

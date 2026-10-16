@@ -1,9 +1,15 @@
 #include <algorithm>
 #include <charconv>
+#include <cstdio>
 #include <filesystem>
-#include <print>
+#include <mutex>
+#include "gcrank/detail/print.h"
 #include <string>
 #include <string_view>
+
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 #include "gcrank/error.h"
 #include "gcrank/format.h"
@@ -19,14 +25,16 @@ const char* const kUsage =
     "\n"
     "Required:\n"
     "  --fasta <path>      Input FASTA file, plain or gzip (sniffed by magic bytes,\n"
-    "                      never by extension)\n"
+    "                      never by extension). \"-\" reads stdin, which also\n"
+    "                      accepts pipes and process substitution\n"
     "  --out <dir>         Directory that receives <NAME>.gcrank/\n"
     "\n"
     "Options:\n"
     "  --name <name>       Index name. Default: the input file name with a\n"
-    "                      compression suffix and a .fa/.fasta/.fna suffix removed\n"
-    "  --chunk-size <N>    Bases per parallel work unit. Default: 100000000\n"
-    "  --threads <N>       Worker threads. Default: min(8, CPU count)\n"
+    "                      compression or FASTA suffix removed (stdin for -)\n"
+    "  --chunk-size <N>    Bases per parallel work unit. Default: 16000000\n"
+    "                      (maximum 1073741824)\n"
+    "  --threads <N>       Worker threads. Default: min(8, CPU count) (max 1024)\n"
     "  --overwrite         Replace an existing index\n"
     "  --verbose           Progress and timing on stderr\n"
     "  --version           Print version information and exit\n"
@@ -38,7 +46,7 @@ struct Options {
   std::string fasta;
   std::string out;
   std::string name;
-  uint64_t chunk = 100000000ull;
+  uint64_t chunk = 16000000ull;
   unsigned threads = gcrank::default_threads();
   bool overwrite = false;
   bool verbose = false;
@@ -92,9 +100,11 @@ Options parse_args(int argc, char** argv) {
     } else if (arg == "--name") {
       options.name = take_value(arg);
     } else if (arg == "--chunk-size") {
-      options.chunk = parse_uint(arg, take_value(arg), 1000000000000ull);
+      // 1 GiB per work unit is already 1.25 GiB of buffers per slot; refusing
+      // absurd values beats silently trying to allocate a terabyte.
+      options.chunk = parse_uint(arg, take_value(arg), 1ull << 30);
     } else if (arg == "--threads") {
-      const uint64_t threads = parse_uint(arg, take_value(arg), 1000000ull);
+      const uint64_t threads = parse_uint(arg, take_value(arg), 1024ull);
       if (threads == 0) throw gcrank::UsageError("--threads must be >= 1");
       options.threads = static_cast<unsigned>(threads);
     } else if (arg == "--overwrite") {
@@ -130,8 +140,9 @@ bool ends_with_ci(std::string_view text, std::string_view suffix) {
                             to_ascii_lower, to_ascii_lower);
 }
 
-// "reads.fa.gz" -> "reads", "genome" -> "genome".
+// "reads.fa.gz" -> "reads", "genome" -> "genome", "-" -> "stdin".
 std::string default_index_name(const std::string& fasta_path) {
+  if (fasta_path == "-") return "stdin";
   std::string base = std::filesystem::path(fasta_path).filename().string();
   for (const std::string_view suffix : {".gz", ".gzip", ".bgz", ".bgzf"}) {
     if (ends_with_ci(base, suffix)) {
@@ -149,6 +160,18 @@ std::string default_index_name(const std::string& fasta_path) {
   return base;
 }
 
+// Available physical memory in bytes, or 0 when it cannot be determined.
+uint64_t available_ram_bytes() {
+#if defined(_WIN32)
+  return 0;
+#else
+  const long pages = ::sysconf(_SC_AVPHYS_PAGES);
+  const long page_size = ::sysconf(_SC_PAGESIZE);
+  if (pages <= 0 || page_size <= 0) return 0;
+  return static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
+#endif
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -156,17 +179,17 @@ int main(int argc, char** argv) {
   try {
     options = parse_args(argc, argv);
   } catch (const gcrank::UsageError& error) {
-    std::print(stderr, "gcrank-build: error: {}\n", error.what());
-    std::print(stderr, "Try 'gcrank-build --help' for more information.\n");
+    gcrank::detail::print(stderr, "gcrank-build: error: {}\n", error.what());
+    gcrank::detail::print(stderr, "Try 'gcrank-build --help' for more information.\n");
     return 1;
   }
 
   if (options.help) {
-    std::print(stdout, "{}", kUsage);
+    gcrank::detail::print(stdout, "{}", kUsage);
     return 0;
   }
   if (options.version) {
-    std::print("gcrank-build {} (format {})\n", gcrank::kBuilderVersion, gcrank::kFormatVersion);
+    gcrank::detail::print("gcrank-build {} (format {})\n", gcrank::kBuilderVersion, gcrank::kFormatVersion);
     return 0;
   }
 
@@ -177,8 +200,24 @@ int main(int argc, char** argv) {
     build_options.chunk_bits = options.chunk;
     build_options.threads = options.threads;
     build_options.verbose = options.verbose;
+    // The library never writes to stderr; the CLI installs the stderr sink.
+    std::mutex log_mutex;
+    build_options.log = [&log_mutex](gcrank::LogLevel level, std::string_view message) {
+      std::lock_guard<std::mutex> lock(log_mutex);
+      gcrank::detail::print(stderr, "[gcrank] {}{}\n",
+                 level == gcrank::LogLevel::Warning ? "warning: " : "", message);
+      std::fflush(stderr);
+    };
 
     gcrank::GcRank index;
+    // Warn about an obviously oversized footprint before allocating it.
+    const uint64_t estimated = (options.chunk * (options.threads + 2) * 5) / 4;
+    const uint64_t available = available_ram_bytes();
+    if (available != 0 && estimated > available)
+      gcrank::detail::print(stderr,
+                 "gcrank-build: warning: estimated peak memory {} MiB exceeds the {} MiB "
+                 "available; lower --chunk-size or --threads\n",
+                 estimated >> 20, available >> 20);
     index.build(options.fasta, build_options);
     index.save(options.out, name, options.overwrite);
 
@@ -188,23 +227,29 @@ int main(int argc, char** argv) {
       std::error_code ec;
       for (const auto& entry : std::filesystem::recursive_directory_iterator(dir, ec))
         if (entry.is_regular_file()) bytes += entry.file_size(ec);
-      std::print(stderr, "[gcrank] wrote {} ({} bytes)\n", dir.string(), bytes);
-      std::print(stderr, "[gcrank] {} bases, {} contigs, GC fraction {:.6f}\n",
-                 index.total_bases(), index.contigs().size(),
-                 index.gc_fraction(0, index.total_bases(), false));
+      gcrank::detail::print(stderr, "[gcrank] wrote {} ({} bytes)\n", dir.string(), bytes);
+      gcrank::detail::print(stderr, "[gcrank] {} bases, {} contigs, ", index.total_bases(),
+                 index.contigs().size());
+      if (index.total_bases() == 0) {
+        // gc_fraction() rejects an empty window, and an empty FASTA is valid.
+        gcrank::detail::print(stderr, "GC fraction n/a (empty genome)\n");
+      } else {
+        gcrank::detail::print(stderr, "GC fraction {:.6f}\n",
+                   index.gc_fraction(0, index.total_bases(), false));
+      }
     }
     return 0;
   } catch (const gcrank::UsageError& error) {
-    std::print(stderr, "gcrank-build: error: {}\n", error.what());
+    gcrank::detail::print(stderr, "gcrank-build: error: {}\n", error.what());
     return 1;
   } catch (const gcrank::InputError& error) {
-    std::print(stderr, "gcrank-build: input error: {}\n", error.what());
+    gcrank::detail::print(stderr, "gcrank-build: input error: {}\n", error.what());
     return 2;
   } catch (const gcrank::OutputError& error) {
-    std::print(stderr, "gcrank-build: output error: {}\n", error.what());
+    gcrank::detail::print(stderr, "gcrank-build: output error: {}\n", error.what());
     return 3;
   } catch (const std::exception& error) {
-    std::print(stderr, "gcrank-build: error: {}\n", error.what());
+    gcrank::detail::print(stderr, "gcrank-build: error: {}\n", error.what());
     return 4;
   }
 }

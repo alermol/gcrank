@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "gcrank/error.h"
-#include "gcrank/fasta_reader.h"
+#include "gcrank/detail/fasta_reader.h"
 #include "gcrank/format.h"
 #include "test_util.h"
 
@@ -51,6 +51,35 @@ Collected collect(const std::string& path, uint64_t block_bases) {
 }
 
 Collected collect(const std::string& path) { return collect(path, 1u << 20); }
+
+// Same as collect(), but moving each block out with take_block() (as the build
+// pipeline does) instead of copying it.
+Collected collect_taken(const std::string& path, uint64_t block_bases) {
+  Collected out;
+  std::unique_ptr<FastaReader> reader = FastaReader::from_path(path, block_bases);
+  std::vector<char> block;
+  for (;;) {
+    switch (reader->next()) {
+      case FastaReader::Event::ContigBegin:
+        out.contig_names.push_back(reader->contig_name());
+        ++out.contig_events;
+        break;
+      case FastaReader::Event::Block:
+        reader->take_block(block);
+        out.block_sizes.push_back(block.size());
+        out.sequence.append(block.begin(), block.end());
+        REQUIRE(block.capacity() >= block.size());
+        break;
+      case FastaReader::Event::ContigEnd:
+        out.contig_lengths.push_back(reader->contig_bases());
+        ++out.contig_events;
+        break;
+      case FastaReader::Event::End:
+        out.saw_end = true;
+        return out;
+    }
+  }
+}
 
 void check_block_sizes(const Collected& out, uint64_t block_bases) {
   for (const uint64_t size : out.block_sizes) {
@@ -316,6 +345,130 @@ TEST_CASE("fasta: missing file and zero block size") {
   gctest::write_text(path, ">a\nACGT\n");
   CHECK_THROWS_AS(collect(path.string(), 0), UsageError);
   CHECK_THROWS_AS(FastaReader(nullptr, 10), UsageError);
+}
+
+TEST_CASE("fasta: take_block moves the same bytes and recycles the buffer") {
+  const std::string path = gctest::data_file("test_small.fa").string();
+  const Collected copied = collect(path, 997);
+  const Collected taken = collect_taken(path, 997);
+  CHECK(taken.sequence == copied.sequence);
+  CHECK(taken.contig_names == copied.contig_names);
+  CHECK(taken.contig_lengths == copied.contig_lengths);
+  CHECK(taken.block_sizes == copied.block_sizes);
+  CHECK(taken.saw_end);
+}
+
+TEST_CASE("fasta: truncated gzip input is rejected, not read as a shorter genome") {
+  gctest::TempDir tmp("fasta-truncated-gz");
+  const std::string payload = ">chr1\nACGTACGTAC\n>chr2\nGGGG\n";
+  const std::string gz = gctest::gzip_member(payload);
+  const fs::path path = tmp.file("genome.fa.gz");
+  gctest::write_text(path, gz);
+
+  // The complete member parses.
+  const Collected whole = collect(path.string());
+  CHECK(whole.sequence == "ACGTACGTACGGGG");
+
+  // Every cut inside the member (header, data, trailer) must fail instead of
+  // quietly returning the bytes up to the cut. Cuts that remove the gzip magic
+  // entirely are not in this list: those files are not gzip and are parsed as
+  // (malformed) plain input instead.
+  const std::size_t cuts[] = {2, 9, 10, 11, 15, gz.size() / 2, gz.size() - 8, gz.size() - 1};
+  for (const std::size_t cut : cuts) {
+    CAPTURE(cut);
+    gctest::write_text(path, gz.substr(0, cut));
+    CHECK_THROWS_AS(collect(path.string()), InputError);
+  }
+}
+
+TEST_CASE("fasta: a multi-member gzip parses like the concatenated members") {
+  gctest::TempDir tmp("fasta-multimember-gz");
+  const std::string first = ">chr1\nACGTACGTAC\n";
+  const std::string second = ">chr2\nGGGGTTTT\n";
+  const fs::path path = tmp.file("multi.fa.gz");
+  gctest::write_text(path, gctest::gzip_multi_member({first, second}));
+
+  const Collected out = collect(path.string(), 3);
+  CHECK(out.contig_names == std::vector<std::string>{"chr1", "chr2"});
+  CHECK(out.contig_lengths == std::vector<uint64_t>{10, 8});
+  CHECK(out.sequence == "ACGTACGTACGGGGTTTT");
+
+  // A member-aligned truncation is a valid (shorter) gzip stream; only a cut
+  // inside a member can be detected. This documents the limitation for
+  // multi-member inputs such as BGZF.
+  const std::string stream = gctest::gzip_multi_member({first, second});
+  const std::size_t member_one = gctest::gzip_member(first).size();
+  gctest::write_text(path, stream.substr(0, member_one));
+  const Collected shorter = collect(path.string());
+  CHECK(shorter.contig_names == std::vector<std::string>{"chr1"});
+  CHECK(shorter.sequence == "ACGTACGTAC");
+}
+
+TEST_CASE("fasta: empty and duplicate contig names are rejected") {
+  gctest::TempDir tmp("fasta-names");
+  struct Case {
+    const char* file;
+    const char* content;
+    const char* needle;
+  };
+  const Case cases[] = {
+      {"dup.fa", ">chr1\nACGT\n>chr1\nACGT\n", "duplicate contig name 'chr1'"},
+      {"dup_desc.fa", ">chr1 one\nACGT\n>chr1 two\nACGT\n", "duplicate contig name 'chr1'"},
+      {"empty.fa", ">\nACGT\n", "empty contig name"},
+      {"blank.fa", ">   \nACGT\n", "empty contig name"},
+  };
+  for (const Case& test_case : cases) {
+    CAPTURE(test_case.file);
+    const fs::path path = tmp.file(test_case.file);
+    gctest::write_text(path, test_case.content);
+    CHECK_THROWS_WITH(collect(path.string()), doctest::Contains(test_case.needle));
+  }
+
+  // Distinct names are still fine, including names that repeat a token of a
+  // description.
+  const fs::path ok = tmp.file("ok.fa");
+  gctest::write_text(ok, ">chr1 desc\nACGT\n>chr2\nACGT\n");
+  CHECK(collect(ok.string()).contig_names == std::vector<std::string>{"chr1", "chr2"});
+}
+
+TEST_CASE("fasta: an unwrapped (single-line) contig does not cost line-sized memory") {
+  if (gctest::rss_bytes() == 0) {
+    MESSAGE("RSS measurement is unavailable on this platform; skipping");
+    return;
+  }
+  gctest::TempDir tmp("fasta-unwrapped");
+  const fs::path path = tmp.file("unwrapped.fa");
+  const uint64_t bases = 32ull << 20;  // 32 MiB on a single line
+  {
+    std::string text = ">big\n";
+    text.reserve(static_cast<std::size_t>(bases) + 8);
+    for (uint64_t i = 0; i < bases; ++i) text += "ACGT"[i % 4];
+    text += '\n';
+    gctest::write_text(path, text);
+  }
+
+  gctest::release_free_memory();
+  const uint64_t before = gctest::rss_bytes();
+  uint64_t seen = 0;
+  {
+    std::unique_ptr<FastaReader> reader = FastaReader::from_path(path.string(), 1u << 20);
+    std::vector<char> block;
+    for (;;) {
+      const FastaReader::Event event = reader->next();
+      if (event == FastaReader::Event::End) break;
+      if (event == FastaReader::Event::Block) {
+        reader->take_block(block);
+        seen += block.size();
+      }
+    }
+  }
+  const int64_t growth =
+      static_cast<int64_t>(gctest::rss_bytes()) - static_cast<int64_t>(before);
+  MESSAGE("unwrapped line growth: " << growth << " bytes for " << bases << " bases");
+  CHECK(seen == bases);
+  // Materializing the line would grow the process by at least the line size;
+  // the piece-wise reader only ever holds a block and a buffer.
+  CHECK(growth < static_cast<int64_t>(bases / 2));
 }
 
 TEST_CASE("fasta: statistics accessors") {

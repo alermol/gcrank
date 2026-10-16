@@ -30,6 +30,9 @@ private:
 // Lowercase hex digest of a memory buffer.
 std::string sha256_hex(const void* data, std::size_t n);
 
+// Lowercase hex encoding of an already-computed 32-byte digest.
+std::string sha256_hex_from_digest(const uint8_t digest[32]);
+
 // Lowercase hex digest of the exact bytes of a file. Throws IoError.
 std::string sha256_file_hex(const std::string& path);
 

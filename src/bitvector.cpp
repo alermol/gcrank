@@ -1,11 +1,11 @@
-#include "gcrank/bitvector.h"
+#include "gcrank/detail/bitvector.h"
 
 #include <algorithm>
 #include <bit>
 #include <cstring>
 #include <fstream>
 
-#include "gcrank/crc32.h"
+#include "gcrank/detail/crc32.h"
 
 namespace gcrank {
 
@@ -21,6 +21,12 @@ inline uint64_t load_le64(const uint8_t* p) {
 inline void store_le64(uint8_t* p, uint64_t v) {
   if constexpr (std::endian::native == std::endian::big) v = std::byteswap(v);
   std::memcpy(p, &v, sizeof(v));
+}
+// Rank scalars are always written little-endian (the manifest records the
+// byte order, so a reader on a big-endian host swaps).
+inline void store_le16(uint8_t* p, uint16_t v) {
+  p[0] = static_cast<uint8_t>(v & 0xFFu);
+  p[1] = static_cast<uint8_t>(v >> 8);
 }
 }  // namespace
 
@@ -100,20 +106,20 @@ void BitVector::finalize() {
   for (uint64_t i = 0; i < num_words_; ++i) {
     const uint64_t pos = i << 6;
     if ((pos & (kSuperblockBits - 1)) == 0) {
-      const uint64_t b = pos >> 12;
+      const uint64_t b = pos >> kSuperblockShift;
       while (next_sb <= b) sb_owned_[static_cast<std::size_t>(next_sb++)] = total;
     }
     if ((pos & (kBasicBlockBits - 1)) == 0) {
-      const uint64_t b = pos >> 9;
-      const uint64_t base = sb_owned_[pos >> 12];
+      const uint64_t b = pos >> kBasicBlockShift;
+      const uint64_t base = sb_owned_[pos >> kSuperblockShift];
       while (next_bb <= b)
         bb_owned_[static_cast<std::size_t>(next_bb++)] = static_cast<uint16_t>(total - base);
     }
-    total += static_cast<uint64_t>(popcount64(words[static_cast<std::size_t>(i)]));
+    total += static_cast<uint64_t>(std::popcount(words[static_cast<std::size_t>(i)]));
   }
   while (next_sb <= num_sb_ - 1) sb_owned_[static_cast<std::size_t>(next_sb++)] = total;
   while (next_bb <= num_bb_ - 1) {
-    const uint64_t base = sb_owned_[(next_bb * kBasicBlockBits) >> 12];
+    const uint64_t base = sb_owned_[(next_bb * kBasicBlockBits) >> kSuperblockShift];
     bb_owned_[static_cast<std::size_t>(next_bb++)] = static_cast<uint16_t>(total - base);
   }
   bind_rank_views();
@@ -128,19 +134,19 @@ uint64_t BitVector::rank1(uint64_t pos) const {
   if (sb_view_.empty())
     throw Error("BitVector::rank1: rank index not built (call finalize() or load_rank())");
   if (pos > size_) throw QueryError("BitVector::rank1: position out of range");
-  const uint64_t sb = pos >> 12;
-  const uint64_t bb = pos >> 9;
+  const uint64_t sb = pos >> kSuperblockShift;
+  const uint64_t bb = pos >> kBasicBlockShift;
   uint64_t r = sb_view_[static_cast<std::size_t>(sb)] + bb_view_[static_cast<std::size_t>(bb)];
   const unsigned bit_in_bb = static_cast<unsigned>(pos & (kBasicBlockBits - 1));
   const uint64_t base_word = bb * (kBasicBlockBits / 64);
   const uint64_t nwords = bit_in_bb >> 6;
   const std::span<const uint64_t> words = words_data();
   for (uint64_t i = 0; i < nwords; ++i)
-    r += static_cast<uint64_t>(popcount64(words[static_cast<std::size_t>(base_word + i)]));
+    r += static_cast<uint64_t>(std::popcount(words[static_cast<std::size_t>(base_word + i)]));
   const unsigned tail = bit_in_bb & 63u;
   if (tail != 0)
     r += static_cast<uint64_t>(
-        popcount64(words[static_cast<std::size_t>(base_word + nwords)] & mask_high_bits(tail)));
+        std::popcount(words[static_cast<std::size_t>(base_word + nwords)] & mask_high_bits(tail)));
   return r;
 }
 
@@ -219,12 +225,20 @@ FileInfo BitVector::save_rank(const std::string& path) const {
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
   if (!out) throw OutputError("cannot open '" + path + "' for writing");
   CRC32 crc;
-  // Scalars are written in host byte order; the manifest records which one.
+  // Scalars are always stored little-endian; the manifest's `endianness`
+  // records that, so readers on big-endian hosts swap.
   const std::size_t sb_bytes = sb_view_.size() * sizeof(uint64_t);
   const std::size_t bb_bytes = bb_view_.size() * sizeof(uint16_t);
   std::vector<uint8_t> buf(sb_bytes + bb_bytes);
-  std::memcpy(buf.data(), sb_view_.data(), sb_bytes);
-  std::memcpy(buf.data() + sb_bytes, bb_view_.data(), bb_bytes);
+  uint8_t* p = buf.data();
+  for (const uint64_t rank : sb_view_) {
+    store_le64(p, rank);
+    p += sizeof(uint64_t);
+  }
+  for (const uint16_t rank : bb_view_) {
+    store_le16(p, rank);
+    p += sizeof(uint16_t);
+  }
   out.write(reinterpret_cast<const char*>(buf.data()),
             static_cast<std::streamsize>(buf.size()));
   out.flush();
@@ -290,14 +304,19 @@ void BitVector::map_bv(MappedFile file, uint64_t nbits) {
   if (host_is_little_endian() && file.data() != nullptr) {
     words_view_ = std::span<const uint64_t>(
         reinterpret_cast<const uint64_t*>(file.data()), static_cast<std::size_t>(num_words_));
-  } else if (num_words_ > 0) {
-    words_.assign(static_cast<std::size_t>(num_words_), 0);
-    const uint8_t* p = file.data();
-    for (uint64_t i = 0; i < num_words_; ++i)
-      words_[static_cast<std::size_t>(i)] = load_le64(p + 8 * i);
+    maps_.push_back(std::move(file));  // keeps the view alive
+    mapped_ = true;
+  } else {
+    // A big-endian host (or an empty vector): materialize into heap storage.
+    // Nothing stays mapped, so is_mapped() must say so (the file is released).
+    if (num_words_ > 0) {
+      words_.assign(static_cast<std::size_t>(num_words_), 0);
+      const uint8_t* p = file.data();
+      for (uint64_t i = 0; i < num_words_; ++i)
+        words_[static_cast<std::size_t>(i)] = load_le64(p + 8 * i);
+    }
+    mapped_ = false;
   }
-  maps_.push_back(std::move(file));
-  mapped_ = true;
 }
 
 void BitVector::map_rank(MappedFile file, uint64_t nbits, bool stored_little_endian) {
@@ -307,6 +326,7 @@ void BitVector::map_rank(MappedFile file, uint64_t nbits, bool stored_little_end
   if (file.size() != expect)
     throw FormatError("'" + file.name() + "': mapped size " + std::to_string(file.size()) +
                       " does not match the expected " + std::to_string(expect) + " bytes");
+  const std::string name = file.name();
   clear_rank();
   num_sb_ = nsb;
   num_bb_ = nbb;
@@ -315,8 +335,11 @@ void BitVector::map_rank(MappedFile file, uint64_t nbits, bool stored_little_end
                                          static_cast<std::size_t>(nsb));
     bb_view_ = std::span<const uint16_t>(
         reinterpret_cast<const uint16_t*>(file.data() + nsb * 8), static_cast<std::size_t>(nbb));
+    maps_.push_back(std::move(file));  // keeps the views alive
+    mapped_ = true;
   } else {
-    // Byte order differs: materialize swapped copies.
+    // Byte order differs: materialize swapped copies on the heap instead of
+    // swapping in every rank1() call.
     const uint8_t* base = file.data();
     sb_owned_.resize(static_cast<std::size_t>(nsb));
     bb_owned_.resize(static_cast<std::size_t>(nbb));
@@ -332,9 +355,7 @@ void BitVector::map_rank(MappedFile file, uint64_t nbits, bool stored_little_end
     }
     bind_rank_views();
   }
-  maps_.push_back(std::move(file));
-  mapped_ = true;
-  validate_rank_index(maps_.back().name());
+  validate_rank_index(name);
 }
 
 void BitVector::validate_rank_index(const std::string& path) const {
@@ -344,9 +365,23 @@ void BitVector::validate_rank_index(const std::string& path) const {
       throw FormatError("'" + path + "': rank index is not monotonic");
     prev = rank;
   }
-  for (const uint16_t rank : bb_view_) {
+  // Within a superblock, basic-block ranks are relative to the superblock start
+  // and must therefore restart at zero and never decrease. Padding entries past
+  // the end of the vector repeat the end-of-vector rank, which also satisfies
+  // this.
+  constexpr std::size_t kBasicBlocksPerSuperblock = kSuperblockBits / kBasicBlockBits;
+  for (std::size_t j = 0; j < bb_view_.size(); ++j) {
+    const uint16_t rank = bb_view_[j];
     if (rank > kSuperblockBits)
       throw FormatError("'" + path + "': basic-block rank entry out of range");
+    if (j % kBasicBlocksPerSuperblock == 0) {
+      if (rank != 0)
+        throw FormatError("'" + path +
+                          "': basic-block rank does not restart at a superblock boundary");
+    } else if (rank < bb_view_[j - 1]) {
+      throw FormatError("'" + path +
+                        "': basic-block ranks are not monotonic within a superblock");
+    }
   }
 }
 

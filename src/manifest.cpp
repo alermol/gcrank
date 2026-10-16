@@ -13,7 +13,7 @@
 #include <utility>
 #include <vector>
 
-#include "gcrank/crc32.h"
+#include "gcrank/detail/crc32.h"
 #include "gcrank/error.h"
 
 namespace gcrank {
@@ -90,6 +90,13 @@ private:
                       std::to_string(pos_) + ": " + message);
   }
 
+  // Depth guard: an unbounded recursion could exhaust the stack on hostile
+  // input. The manifest is at most three levels deep.
+  struct DepthGuard {
+    std::size_t& depth;
+    ~DepthGuard() { --depth; }
+  };
+
   void skip_whitespace() {
     while (pos_ < text_.size()) {
       const char c = text_[pos_];
@@ -143,6 +150,9 @@ private:
   }
 
   JsonValue parse_object() {
+    if (depth_ >= 64) fail("nesting is too deep");
+    DepthGuard guard{depth_};
+    ++depth_;
     JsonValue v = JsonValue::make_object();
     expect('{');
     skip_whitespace();
@@ -172,6 +182,9 @@ private:
   }
 
   JsonValue parse_array() {
+    if (depth_ >= 64) fail("nesting is too deep");
+    DepthGuard guard{depth_};
+    ++depth_;
     JsonValue v;
     v.type = JsonValue::Type::Array;
     expect('[');
@@ -259,6 +272,8 @@ private:
         case 't': out.push_back('\t'); break;
         case 'u': {
           unsigned cp = parse_hex4();
+          if (cp >= 0xDC00 && cp <= 0xDFFF)
+            fail("lone low surrogate in \\u escape");
           if (cp >= 0xD800 && cp <= 0xDBFF) {
             // Surrogate pair.
             if (pos_ + 1 < text_.size() && text_[pos_] == '\\' && text_[pos_ + 1] == 'u') {
@@ -286,17 +301,24 @@ private:
     if (pos_ < text_.size() && text_[pos_] == '-') ++pos_;
     if (pos_ >= text_.size() || text_[pos_] < '0' || text_[pos_] > '9')
       fail("invalid value");
+    const std::size_t first_digit = pos_;
     while (pos_ < text_.size() && text_[pos_] >= '0' && text_[pos_] <= '9') ++pos_;
+    if (pos_ - first_digit > 1 && text_[first_digit] == '0')
+      fail("leading zeros are not allowed in numbers");
     bool is_integer = true;
     if (pos_ < text_.size() && text_[pos_] == '.') {
       is_integer = false;
       ++pos_;
+      if (pos_ >= text_.size() || text_[pos_] < '0' || text_[pos_] > '9')
+        fail("expected a digit after '.'");
       while (pos_ < text_.size() && text_[pos_] >= '0' && text_[pos_] <= '9') ++pos_;
     }
     if (pos_ < text_.size() && (text_[pos_] == 'e' || text_[pos_] == 'E')) {
       is_integer = false;
       ++pos_;
       if (pos_ < text_.size() && (text_[pos_] == '+' || text_[pos_] == '-')) ++pos_;
+      if (pos_ >= text_.size() || text_[pos_] < '0' || text_[pos_] > '9')
+        fail("expected a digit in the exponent");
       while (pos_ < text_.size() && text_[pos_] >= '0' && text_[pos_] <= '9') ++pos_;
     }
     const std::string_view token = text_.substr(start, pos_ - start);
@@ -328,6 +350,7 @@ private:
   const std::string_view text_;
   std::string origin_;
   std::size_t pos_ = 0;
+  std::size_t depth_ = 0;
 };
 
 // ---- writer --------------------------------------------------------------
@@ -524,6 +547,10 @@ std::string Manifest::to_json() const {
   index_json.set("superblock_bits", JsonValue::make_uint(superblock_bits));
   index_json.set("basic_block_bits", JsonValue::make_uint(basic_block_bits));
   index_json.set("remove_ambiguous_supported", JsonValue::make_bool(remove_ambiguous_supported));
+  if (has_totals) {
+    index_json.set("total_gc", JsonValue::make_uint(total_gc));
+    index_json.set("total_valid", JsonValue::make_uint(total_valid));
+  }
   root.set("index", std::move(index_json));
 
   JsonValue files_json = JsonValue::make_object();
@@ -565,8 +592,8 @@ Manifest Manifest::from_json(std::string_view text, const std::string& origin) {
   manifest.source.sha256 = require_string(source, "sha256", ctx);
   manifest.source.total_bases = require_uint(source, "total_bases", ctx);
   manifest.source.num_contigs = require_uint(source, "num_contigs", ctx);
-  if (const JsonValue* bytes = source.find("file_bytes"))
-    manifest.source.file_bytes = bytes->integer;
+  if (source.find("file_bytes") != nullptr)
+    manifest.source.file_bytes = require_uint(source, "file_bytes", ctx);
 
   const JsonValue& index = require_object(root, "index", ctx);
   manifest.bit_order = require_string(index, "bit_order", ctx);
@@ -585,6 +612,16 @@ Manifest Manifest::from_json(std::string_view text, const std::string& origin) {
   if (!manifest.remove_ambiguous_supported)
     throw FormatError(ctx +
                       ": remove_ambiguous_supported = false is not supported by this build");
+  if (index.find("total_gc") != nullptr) {
+    manifest.total_gc = require_uint(index, "total_gc", ctx);
+    manifest.total_valid = require_uint(index, "total_valid", ctx);
+    manifest.has_totals = true;
+    if (manifest.total_gc > manifest.source.total_bases ||
+        manifest.total_valid > manifest.source.total_bases)
+      throw FormatError(ctx + ": total_gc/total_valid exceed total_bases");
+  } else if (index.find("total_valid") != nullptr) {
+    throw FormatError(ctx + ": missing required key 'index.total_gc'");
+  }
 
   const JsonValue& files = require_object(root, "files", ctx);
   for (const char* name : kDataFiles) {

@@ -1,4 +1,4 @@
-#include "gcrank/thread_pool.h"
+#include "gcrank/detail/thread_pool.h"
 
 namespace gcrank {
 
@@ -67,7 +67,7 @@ void ThreadPool::wait() {
     cv_done_.wait(lock, [this] { return abort_ || (tasks_.empty() && active_ == 0); });
     error = error_;
   }
-  if (error) throw error;
+  if (error) std::rethrow_exception(error);
 }
 
 void ThreadPool::stop() {
@@ -84,7 +84,7 @@ void ThreadPool::stop() {
     std::lock_guard<std::mutex> lock(mutex_);
     error = error_;
   }
-  if (error) throw error;
+  if (error) std::rethrow_exception(error);
 }
 
 }  // namespace gcrank

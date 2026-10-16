@@ -8,6 +8,7 @@
 
 #include "gcrank/error.h"
 #include "gcrank/gc_rank.h"
+#include "gcrank/detail/thread_pool.h"
 #include "test_util.h"
 
 using namespace gcrank;
@@ -97,7 +98,19 @@ TEST_CASE("parallel: a larger synthetic genome is consistent across thread count
   }
 }
 
-TEST_CASE("parallel: threads = 0 falls back to a single worker") {
+TEST_CASE("parallel: task exceptions keep their type through wait() and stop()") {
+  // A failing task must surface as its original exception type on the thread
+  // that owns the pool, not as the std::exception_ptr wrapper.
+  ThreadPool pool(1);
+  pool.submit([] { throw InputError("worker blew up"); });
+  CHECK_THROWS_AS(pool.wait(), InputError);
+
+  ThreadPool second(2);
+  second.submit([] { throw QueryError("bad window"); });
+  CHECK_THROWS_AS(second.stop(), QueryError);
+}
+
+TEST_CASE("parallel: threads = 0 means auto and still matches the single-thread output") {
   gctest::TempDir tmp("parallel-zero");
   const gctest::EnvGuard epoch("SOURCE_DATE_EPOCH", "1700000000");
   GcRank index;

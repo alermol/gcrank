@@ -5,9 +5,9 @@
 #include <filesystem>
 #include <vector>
 
-#include "gcrank/bitvector.h"
-#include "gcrank/crc32.h"
-#include "gcrank/input_stream.h"
+#include "gcrank/detail/bitvector.h"
+#include "gcrank/detail/crc32.h"
+#include "gcrank/detail/input_stream.h"
 #include "test_util.h"
 
 using namespace gcrank;
@@ -70,10 +70,10 @@ const uint64_t kBoundaryLengths[] = {0, 1, 63, 64, 65, 511, 512, 513, 4095, 4096
 }  // namespace
 
 TEST_CASE("bitvector: helpers") {
-  CHECK(popcount64(0) == 0);
-  CHECK(popcount64(1) == 1);
-  CHECK(popcount64(~uint64_t(0)) == 64);
-  CHECK(popcount64(0x8000000000000001ull) == 2);
+  CHECK(std::popcount(0u) == 0);
+  CHECK(std::popcount(1u) == 1);
+  CHECK(std::popcount(~uint64_t(0)) == 64);
+  CHECK(std::popcount(0x8000000000000001ull) == 2);
   CHECK(mask_high_bits(0) == 0);
   CHECK(mask_high_bits(1) == 0x8000000000000000ull);
   CHECK(mask_high_bits(2) == 0xC000000000000000ull);
@@ -250,6 +250,116 @@ TEST_CASE("bitvector: rank arrays have the documented extra entry") {
   CHECK(rank_superblock_entries(4096) == 2);
   CHECK(rank_basic_block_entries(4096) == 9);
   CHECK(bitvector.rank1(4096) == bitvector.rank1(4095) + (bits[4095] ? 1u : 0u));
+}
+
+TEST_CASE("bitvector: rank files are little-endian on every host") {
+  gctest::TempDir tmp("bitvector-endian-write");
+  const std::vector<bool> bits = random_bits(4097, 7);
+  const BitVector bitvector = make_bitvector(bits);
+  const fs::path rb_path = tmp.file("genome.rb");
+  bitvector.save_rank(rb_path.string());
+
+  const std::vector<uint8_t> bytes = gctest::read_bytes(rb_path);
+  const uint64_t nsb = rank_superblock_entries(4097);
+  const uint64_t nbb = rank_basic_block_entries(4097);
+  REQUIRE(bytes.size() == rank_bytes(4097));
+  const auto le64 = [&bytes](std::size_t at) {
+    uint64_t value = 0;
+    for (int b = 0; b < 8; ++b) value |= uint64_t(bytes[at + static_cast<std::size_t>(b)]) << (8 * b);
+    return value;
+  };
+  const auto le16 = [&bytes](std::size_t at) {
+    return uint32_t(bytes[at]) | (uint32_t(bytes[at + 1]) << 8);
+  };
+  // Decode with an explicit little-endian reader (no host assumptions) and
+  // compare against the rank arithmetic at every entry, including the padding
+  // entries past the end of the vector.
+  for (uint64_t i = 0; i < nsb; ++i) {
+    const uint64_t pos = std::min<uint64_t>(i * kSuperblockBits, 4097);
+    CHECK(le64(static_cast<std::size_t>(8 * i)) == bitvector.rank1(pos));
+  }
+  for (uint64_t j = 0; j < nbb; ++j) {
+    const uint64_t pos = std::min<uint64_t>(j * kBasicBlockBits, 4097);
+    const uint64_t superblock = (pos / kSuperblockBits) * kSuperblockBits;
+    CHECK(le16(static_cast<std::size_t>(8 * nsb + 2 * j)) ==
+          bitvector.rank1(pos) - bitvector.rank1(superblock));
+  }
+}
+
+TEST_CASE("bitvector: a big-endian rank file loads and maps identically") {
+  gctest::TempDir tmp("bitvector-endian-read");
+  const std::vector<bool> bits = random_bits(4097, 42);
+  const BitVector bitvector = make_bitvector(bits);
+  const fs::path rb_path = tmp.file("genome.rb");
+  const fs::path bv_path = tmp.file("genome.bv");
+  bitvector.save_bv(bv_path.string());
+  bitvector.save_rank(rb_path.string());
+
+  // Byte-swap every scalar, as a writer on a big-endian host would store it.
+  std::vector<uint8_t> bytes = gctest::read_bytes(rb_path);
+  const uint64_t nsb = rank_superblock_entries(4097);
+  const uint64_t nbb = rank_basic_block_entries(4097);
+  for (uint64_t i = 0; i < nsb; ++i)
+    std::reverse(bytes.begin() + static_cast<std::ptrdiff_t>(8 * i),
+                 bytes.begin() + static_cast<std::ptrdiff_t>(8 * i + 8));
+  for (uint64_t j = 0; j < nbb; ++j)
+    std::swap(bytes[static_cast<std::size_t>(8 * nsb + 2 * j)],
+              bytes[static_cast<std::size_t>(8 * nsb + 2 * j + 1)]);
+  const fs::path big_endian_path = tmp.file("genome_be.rb");
+  gctest::write_text(big_endian_path, std::string(bytes.begin(), bytes.end()));
+
+  BitVector loaded;
+  loaded.load_bv(bv_path.string(), 4097);
+  loaded.load_rank(big_endian_path.string(), 4097, /*stored_little_endian=*/false);
+  BitVector mapped;
+  mapped.map_bv(MappedFile::map(bv_path.string()), 4097);
+  mapped.map_rank(MappedFile::map(big_endian_path.string()), 4097, false);
+  for (uint64_t position = 0; position <= 4097; ++position) {
+    CHECK(loaded.rank1(position) == bitvector.rank1(position));
+    CHECK(mapped.rank1(position) == bitvector.rank1(position));
+  }
+}
+
+TEST_CASE("bitvector: rank validation rejects a broken basic-block index") {
+  gctest::TempDir tmp("bitvector-validation");
+  const std::vector<bool> bits = random_bits(4097, 11);
+  const BitVector bitvector = make_bitvector(bits);
+  const fs::path rb_path = tmp.file("genome.rb");
+  bitvector.save_rank(rb_path.string());
+  const uint64_t nsb = rank_superblock_entries(4097);
+  const uint64_t nbb = rank_basic_block_entries(4097);
+  const std::vector<uint8_t> clean = gctest::read_bytes(rb_path);
+
+  // The first entry of every superblock is a rank relative to that superblock
+  // and must be zero: entry 8 starts the second superblock (4096 bits).
+  REQUIRE(nbb > 8);
+  {
+    std::vector<uint8_t> bytes = clean;
+    const std::size_t at = static_cast<std::size_t>(8 * nsb + 2 * 8);
+    bytes[at] = 1;
+    bytes[at + 1] = 0;
+    gctest::write_text(rb_path, std::string(bytes.begin(), bytes.end()));
+    BitVector broken;
+    CHECK_THROWS_AS(broken.load_rank(rb_path.string(), 4097, true), FormatError);
+  }
+  // A decreasing pair inside one superblock is impossible.
+  {
+    std::vector<uint8_t> bytes = clean;
+    // Entry 2 follows entry 1 in the first superblock; force it below entry 1
+    // (or wrap to 0xFFFF, which is also out of range).
+    const uint16_t previous = static_cast<uint16_t>(bytes[8 * nsb + 2] |
+                                                    (bytes[8 * nsb + 3] << 8));
+    const uint16_t forbidden = static_cast<uint16_t>(previous - 1);
+    bytes[8 * nsb + 4] = static_cast<uint8_t>(forbidden & 0xFFu);
+    bytes[8 * nsb + 5] = static_cast<uint8_t>(forbidden >> 8);
+    gctest::write_text(rb_path, std::string(bytes.begin(), bytes.end()));
+    BitVector broken;
+    CHECK_THROWS_AS(broken.load_rank(rb_path.string(), 4097, true), FormatError);
+  }
+  // The clean file still loads.
+  gctest::write_text(rb_path, std::string(clean.begin(), clean.end()));
+  BitVector good;
+  CHECK_NOTHROW(good.load_rank(rb_path.string(), 4097, true));
 }
 
 TEST_CASE("bitvector: corrupt or mismatched files are rejected") {

@@ -1,6 +1,6 @@
 #pragma once
 //
-// On-disk format contract for `.gcrank` indexes, format_version "1.0.0".
+// On-disk format contract for `.gcrank` indexes, format_version "0.1.0".
 //
 // Layout of `<NAME>.gcrank/`:
 //
@@ -12,23 +12,33 @@
 //   valid.rb          rank index for valid.bv
 //   <file>.crc32      sidecar checksums, "<8 lowercase hex digits>\n"
 //
-// Bit order (bit_order = "msb0"): bit `i` of a bitvector is bit `(7 - i%8)` of
-// byte `i/8` of the file. The stream of bytes is grouped into 64-bit words for
-// the in-memory representation with the first byte in the least significant
-// position; this grouping is fixed by the format and is host-independent.
+// Bit order (bit_order = "msb0"): the file is a sequence of 64-bit words
+// stored little-endian (the first byte of each 8-byte group is the least
+// significant byte of the word). Bit `i` of a bitvector is bit `63 - (i % 64)`
+// of word `i / 64`, so in terms of file bytes it is bit `(7 - i % 8)` of byte
+// `8 * (i / 64) + 7 - (i % 64) / 8`. This grouping is fixed by the format and
+// is host-independent.
 //
 // genome.bv / valid.bv: `bv_bytes(nbits)` bytes, zero padded to a whole number
 // of superblocks (4096 bits). The logical size (total_bases) lives in the
-// manifest. Ambiguous input (N, U, R, Y, S, W, K, M, B, D, H, V) sets neither
-// bit: those positions are neither GC nor valid.
+// manifest. Ambiguous input (N, R, Y, S, W, K, M, B, D, H, V) sets neither
+// bit: those positions are neither GC nor valid. U is not ambiguous: it is the
+// RNA spelling of T, so it counts as valid and never as GC.
 //
-// genome.rb / valid.rb: multilbyte scalars stored in the byte order recorded
-// by the manifest's `endianness` field; readers byte-swap when the host order
-// differs. The layout is
+// genome.rb / valid.rb: multi-byte scalars stored in the byte order recorded
+// by the manifest's `endianness` field. Writers store little-endian; readers
+// byte-swap when the recorded order differs from the host's, so an index loads
+// on any host and an index written in the opposite order is read correctly.
+// The layout is
 //   (num_superblocks(nbits) + 1) x uint64   absolute rank at i*4096
 //   (num_basic_blocks(nbits) + 1) x uint16  rank within the superblock at j*512
 // The extra trailing entry of each array is the rank at the end of the vector,
 // so rank1(pos) is defined for every pos in [0, nbits].
+//
+// The manifest's `index` object carries the population counts of the two
+// bitvectors (`total_gc`, `total_valid`); loading cross-checks them against the
+// end-of-vector ranks, so a corrupt rank index is rejected even when the full
+// data-file checksums are skipped.
 //
 #include <array>
 #include <bit>
@@ -45,14 +55,21 @@ namespace gcrank {
 // ---- versions ------------------------------------------------------------
 
 // Version of the on-disk format (the public contract).
-inline constexpr const char* kFormatVersion = "1.0.0";
-// Version of the writer (library/builder); changes freely across releases.
-inline constexpr const char* kBuilderVersion = "2.0.0";
+inline constexpr const char* kFormatVersion = "0.1.0";
+// Version of the writer (library/builder).
+inline constexpr const char* kBuilderVersion = "0.1.0";
 
 // ---- index layout --------------------------------------------------------
 
 inline constexpr uint32_t kSuperblockBits = 4096;
 inline constexpr uint32_t kBasicBlockBits = 512;
+// Bit-position shifts; guarded so the two stay in step.
+inline constexpr uint32_t kSuperblockShift = 12;  // 1 << 12 == 4096
+inline constexpr uint32_t kBasicBlockShift = 9;   // 1 << 9 == 512
+static_assert((uint64_t{1} << kSuperblockShift) == kSuperblockBits,
+              "kSuperblockShift must match kSuperblockBits");
+static_assert((uint64_t{1} << kBasicBlockShift) == kBasicBlockBits,
+              "kBasicBlockShift must match kBasicBlockBits");
 inline constexpr const char* kBitOrderMsb0 = "msb0";
 
 inline constexpr const char* kManifestFileName = "manifest.json";

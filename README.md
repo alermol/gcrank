@@ -10,24 +10,34 @@ handled without special cases.
 * **`gc_fraction()` is identical to `bedtools nuc`'s `pct_gc`** — same counts,
   same single-precision arithmetic, same printed digits; see
   [Comparison with `bedtools nuc`](#comparison-with-bedtools-nuc).
-* Library `libgcrank`: C++23, standard library + zlib only (CRC-32, SHA-256
-  and JSON are implemented in-tree); `main()` exists only in the CLI.
+* Library `libgcrank`: C++23 (C++20 to consume the installed headers),
+  standard library + zlib only (CRC-32 via zlib, SHA-256 and JSON implemented
+  in-tree); `main()` exists only in the CLIs.
 * CLI `gcrank-build`: builds an index from a plain or gzip FASTA (format
-  sniffed by magic bytes, never by extension).
+  sniffed by magic bytes, never by extension), including pipes and
+  `/dev/stdin` via `--fasta -`.
+* CLI `gcrank-query`: answers BED intervals or whole-contig tilings from an
+  index, with `bedtools`-identical `pct_gc` output; no C++ needed to query.
+* Contig-relative queries (`gc_count("chr1", start, end)`), so BED coordinates
+  can be passed through unchanged instead of doing offset arithmetic.
 * Parallel builds that are **byte-identical for any thread count and chunk
-  size**.
+  size**, with the source hashed while it is parsed (one pass, no
+  hash/parse mismatch window).
 * `mmap` loading, 64-bit offsets throughout, versioned and checksummed on-disk
-  format.
-* **Tested on Linux** (GCC 14): Release, ASan+UBSan and ThreadSanitizer runs
-  in CI. The Windows and macOS code paths are untested.
+  format (sidecar checksums and rank totals are cross-checked on every load).
+* **Tested on Linux** (GCC 14 and Clang 18): Release, ASan+UBSan and
+  ThreadSanitizer runs in CI. The Windows and macOS code paths are untested.
 
 ## Requirements
 
-* A C++23 compiler: GCC 14+, Clang 18+ (with libstdc++ 14+) or MSVC 19.40+
-  (Visual Studio 2022 17.10+). The build uses `std::print`, `std::format`,
+* To build: a C++23 compiler (CI uses GCC 14 and Clang 18 with libstdc++ 14;
+  GCC 13 is expected to work as well, untested). The build uses `std::format`,
   `std::span`, `<bit>` (`std::byteswap`, `std::endian`, `std::popcount`,
   `std::rotr`), `std::move_only_function`, `std::jthread`, `std::from_chars`
   and the C++20/23 range algorithms.
+* To consume the installed library: C++20 (`std::span`, `std::string_view`);
+  only the four public headers (`error.h`, `format.h`, `gc_rank.h`,
+  `manifest.h`) are installed, everything else lives under `detail/`.
 * CMake 3.20+ and zlib (the only third-party dependency).
 
 ## Quick start
@@ -35,20 +45,54 @@ handled without special cases.
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build                                 # unit + CLI tests
+ctest --test-dir build                                 # unit + CLI + spec + consumer
 
 ./build/gcrank-build --fasta genome.fa.gz --out indexes --verbose
+echo -e 'chr1\t1000\t2000' | ./build/gcrank-query --index indexes/genome.gcrank --bed -
 ```
 
-An index is written atomically to `<out>/<name>.gcrank/` (temp directory →
-checksum verification → rename) and is never overwritten without
-`--overwrite`.
+An index is written atomically to `<out>/<name>.gcrank/` (uniquely named temp
+directory → checksum verification → `fsync` → rename) and is never overwritten
+without `--overwrite`. With `--overwrite`, the new index is fully written and
+verified before the existing one is moved aside, and it is put back if the
+swap fails.
 
-Options: `--fasta <path>`, `--out <dir>`, `--name <name>` (default: input file
-name minus the compression suffix and `.fa`/`.fasta`/`.fna`), `--chunk-size <N>`
-(bases per parallel work unit, default 100,000,000), `--threads <N>` (default
-`min(8, CPUs)`), `--overwrite`, `--verbose`, `--version`, `--help`.
+Options: `--fasta <path>` (or `-` for stdin), `--out <dir>`, `--name <name>`
+(default: the input file name with a compression or FASTA suffix removed, or
+`stdin` for `-`), `--chunk-size <N>` (bases per parallel work unit, default
+16,000,000, at most 1 GiB), `--threads <N>` (default `min(8, CPUs)`, at most
+1024), `--overwrite`, `--verbose`, `--version`, `--help`.
 Exit codes: 0 success, 1 usage, 2 input, 3 output, 4 internal.
+An obviously oversized `--chunk-size × --threads` combination warns before
+allocating.
+
+## Querying an index: `gcrank-query`
+
+```sh
+# BED intervals (chrom, start, end; 0-based half-open, like bedtools)
+gcrank-query --index indexes/genome.gcrank --bed windows.bed > windows.tsv
+
+# the same intervals with ambiguous bases removed from the denominator
+gcrank-query --index indexes/genome.gcrank --bed windows.bed --remove-ambiguous
+
+# genome-wide tiling, no BED file needed
+gcrank-query --index indexes/genome.gcrank --window 10000 --step 5000 > tiles.tsv
+```
+
+Output is tab separated with a `#` header, one row per window:
+
+```
+#chrom  start  end  pct_gc  num_gc  num_valid  seq_len
+```
+
+`pct_gc` is printed with `%.6f` and is bit-identical to `bedtools nuc`'s
+`pct_gc` for the same interval (`num_gc` is `num_C + num_G`; `num_valid` is
+`num_A + num_C + num_G + num_T`, with `U` counted as `T`). `--remove-ambiguous`
+changes the denominator to `num_valid` and prints `nan` where there is no
+`A/C/G/T` base. A window that leaves its contig, or names an unknown contig, is
+reported as an input error with the BED line number instead of silently
+crossing into the next contig. `--bed -` reads BED from stdin; `--mmap` and
+`--no-validate-crc` trade start-up work for speed on huge indexes.
 
 ## Library
 
@@ -71,23 +115,28 @@ int main() {
 
   const uint64_t total = loaded.total_bases();
   std::printf("genome GC:  %.6f\n",
-              loaded.gc_fraction(0, total, remove_ambiguous=false));
+              loaded.gc_fraction(0, total, /*remove_ambiguous=*/false));
   std::printf("[1M, 2M):   %.6f\n",
-              loaded.gc_fraction(1000000, 2000000, remove_ambiguous=true));
+              loaded.gc_fraction(1000000, 2000000, /*remove_ambiguous=*/true));
 }
 ```
 
 Consume the installed package with CMake:
 
 ```cmake
-find_package(gcrank 2.0 REQUIRED)
+find_package(gcrank 0.1 REQUIRED)
 target_link_libraries(app PRIVATE gcrank::gcrank)
 ```
 
 ### Query semantics
 
-Windows are half-open `[start, end)`, 0-based, over the concatenated contigs
-(per-contig offsets live in `contigs.tsv`).
+Windows are half-open `[start, end)`, 0-based. Every query exists twice: with
+global coordinates over the concatenated contigs (per-contig offsets live in
+`contigs.tsv`), and with contig-relative coordinates
+(`index.gc_count("chr1", start, end)`), which reject windows that leave the
+named contig with `QueryError`. Prefer the contig-relative form: BED files are
+contig-relative, and using global coordinates without adding the offset
+returns the neighbouring contig's answer.
 
 | Call | Meaning |
 | --- | --- |
@@ -95,6 +144,7 @@ Windows are half-open `[start, end)`, 0-based, over the concatenated contigs
 | `valid_count(start, end)` | unambiguous `A`/`C`/`G`/`T` bases |
 | `gc_fraction(s, e, false)` | `GC / (e - s)` — the `bedtools nuc` convention |
 | `gc_fraction(s, e, true)` | `GC / valid_count` — ambiguous bases removed |
+| `gc_count("chr1", s, e)` | the same, relative to the contig start |
 
 `gc_fraction` converts the integer counts to `float` and divides in single
 precision exactly like `bedtools nuc`, so `"%.6f"` output is bit-identical to
@@ -164,11 +214,8 @@ The integer columns are exact, so prefer them when writing checks:
 ```cpp
 // For each row of `bedtools nuc -fi genome.fa -bed windows.bed`
 // (chrom, start, end, pct_at, pct_gc, num_A, num_C, num_G, num_T, num_N, num_oth, seq_len):
-const gcrank::ContigInfo* contig = index.contig(chrom);
-const uint64_t begin = contig->offset + start;   // index offsets are global
-const uint64_t finish = contig->offset + end;
-bool ok = (num_g + num_c == index.gc_count(begin, finish)) &&
-          (num_a + num_c + num_g + num_t == index.valid_count(begin, finish)) &&
+bool ok = (num_g + num_c == index.gc_count(chrom, start, end)) &&
+          (num_a + num_c + num_g + num_t == index.valid_count(chrom, start, end)) &&
           (seq_len == end - start);
 ```
 
@@ -185,61 +232,89 @@ bool ok = (num_g + num_c == index.gc_count(begin, finish)) &&
 └── *.crc32              sidecar checksums for every data file
 ```
 
-* Bit `i` is bit `(7 - i%8)` of byte `i/8` (MSB0); bytes are grouped into
-  64-bit words with the first byte least significant — fixed by the format and
-  host-independent.
+* Bit `i` is bit `63 - i%64` of 64-bit little-endian word `i/64`, i.e. bit
+  `(7 - i%8)` of byte `8*(i/64) + 7 - (i%64)/8` of the file (MSB0 within the
+  word) — fixed by the format and host-independent. `data-raw/check_spec.py`
+  (run by CTest as the `spec` test) decodes the golden index with an
+  independent reader that implements exactly this rule.
 * `.bv` files are zero-padded to whole 4096-bit superblocks. `.rb` files hold
   `ceil(n/4096) + 1` absolute ranks (`uint64`) followed by `ceil(n/512) + 1`
-  ranks within their superblock (`uint16`), in the manifest's `endianness`;
-  readers byte-swap when the host differs, so indexes move between hosts. Rank
-  support costs 3 bytes per 512-bit block, 4.7% of a bitvector.
-* `manifest.json` is the source of truth for the logical size and carries a
-  SHA-256 of the source plus size/CRC-32 for every file; it advertises
-  `remove_ambiguous_supported`. The format is documented in
-  `include/gcrank/format.h`.
+  ranks within their superblock (`uint16`). They are always little-endian; the
+  manifest's `endianness` records the byte order, and the reader swaps when an
+  index is stored in the opposite order. Rank support costs 3 bytes per
+  512-bit block, 4.7% of a bitvector.
+* `manifest.json` is the source of truth for the logical size; it carries a
+  SHA-256 of the parsed source stream (identical for a FASTA and its gzip
+  form, since the hash is computed while the input is read), size/CRC-32 for
+  every file, the `index.total_gc` / `index.total_valid` population counts, and
+  the advertised `remove_ambiguous_supported`. Loading always cross-checks the
+  sidecar `.crc32` files and the rank totals against the manifest; the full
+  data-file CRC pass runs unless `validate_crc = false`. The format is
+  documented in `include/gcrank/format.h`.
 
 ## Reproducibility, memory, performance
 
-* Same input, options and `SOURCE_DATE_EPOCH` → byte-identical index,
-  independent of the thread count and `--chunk-size` (both are scheduling
-  knobs only). The manifest's `created` field is the only wall-clock read in
-  the build path; enforced by `test_parallel.cpp`.
+* Same input, options, `SOURCE_DATE_EPOCH` **and path string** → byte-identical
+  index, independent of the thread count and `--chunk-size` (both are
+  scheduling knobs only). The manifest records the source path exactly as
+  given, so a relative and an absolute build of the same file differ in that
+  field; use the same path when comparing. The manifest's `created` field is
+  the only wall-clock read in the build path; enforced by `test_parallel.cpp`.
 * Build peak memory ≈ `1.25 * chunk_bits * (threads + 2)` bytes, plus
   `2 * N/8` for the finished bitvectors and 4.7% of that for the rank indices.
-  Lower `--chunk-size` to reduce the footprint. With `mmap = true`, resident
-  memory is the rank arrays plus whatever the OS pages in; loading a 25 MB
-  index takes ~0.15 s.
-* Queries are rank arithmetic: ~230 ns per random window on a 100 Mb genome,
-  and a whole-genome query costs ~290 ns — window length is irrelevant.
+  The default chunk is 16 M bases, so a 300 Mb genome builds in about 190 MB
+  of RSS regardless of thread count — and regardless of whether the FASTA is
+  wrapped at 60 columns or one single line per contig, because sequence lines
+  are never materialised (measured at 305 MB, Release: ~5.5 s for 1 or 4
+  threads; the parse and hash pass is serial, so extra workers mainly overlap
+  packing).
+* Queries are rank arithmetic and independent of the window length: on the
+  same 300 Mb index, a random window costs ~0.4 µs per count (~0.7 µs for
+  `gc_count` + `valid_count`) and a whole-genome query ~50 ns. Loading with
+  `mmap = true` (`validate_crc = false`) maps the index instead of reading it;
+  a tiling query of 300,000 windows over that index takes ~0.6 s end to end,
+  most of it formatting the output rows.
 
 ## Testing
 
 ```sh
-ctest --test-dir build --output-on-failure      # doctest unit tests + CLI test
-cmake -S . -B build-tsan -DGCRANK_TSAN=ON       # ThreadSanitizer build
+ctest --test-dir build --output-on-failure   # unit + CLI + spec + bedtools + consumer
+cmake -S . -B build-tsan -DGCRANK_TSAN=ON    # ThreadSanitizer build
 ```
 
-The suite covers the rank index at every block boundary, FASTA parsing (plain,
-CRLF, gzip, long lines, invalid bytes, every IUPAC code), `remove_ambiguous`
-semantics, manifest round-trips, mmap vs heap equivalence, thread/chunk
-invariance, and a committed golden index that is rebuilt and compared byte for
-byte. Reference values come from `data-raw/make_expected_gc.py`, which never
-calls gcrank; see `data-raw/README.md` for the regeneration policy.
+CI installs `bedtools` for the Release and Clang jobs, so the `bedtools` test
+runs there; in configurations without it the test skips (CTest reports the
+skip) and the claim can be re-checked by hand with
+`python3 data-raw/check_bedtools_parity.py`.
 
-gcrank is **tested on Linux** (GCC 14). CI
-([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the full suite in
-three configurations on every push and pull request: Release (static and
-shared), ASan + UBSan, and ThreadSanitizer. The Windows and macOS code paths
-exist but are not covered by CI and must be treated as untested.
+The suite covers the rank index at every block boundary, FASTA parsing (plain,
+CRLF, gzip, truncated gzip, multi-member gzip, long and single-line records,
+invalid bytes, every IUPAC code), `remove_ambiguous` semantics, manifest
+round-trips, mmap vs heap equivalence, thread/chunk invariance, the contig-
+relative API, and a committed golden index that is rebuilt and compared byte
+for byte. Reference values come from `data-raw/make_expected_gc.py`, which
+never calls gcrank, and the documented bit layout is checked by
+`data-raw/check_spec.py`; see `data-raw/README.md` for the regeneration policy.
+The `consumer` test installs into a scratch prefix and builds a C++20 project
+against `find_package(gcrank)`, so the exported target and the installed
+headers are tested as a downstream user sees them.
+
+gcrank is **tested on Linux** (GCC 14 and Clang 18). CI
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the full suite on
+every push and pull request: Release with `-Werror` (static and shared),
+Clang 18 with libstdc++ 14, ASan + UBSan, and ThreadSanitizer. The Windows and
+macOS code paths exist but are not covered by CI and must be treated as
+untested (AppleClang's libc++ does not implement `std::format` yet).
 
 ## Layout
 
 ```
-include/gcrank/   public headers (API documentation in the headers)
-src/              library implementation
-cli/              gcrank-build
-tests/            doctest suite, fixtures, golden index
-data-raw/         fixture/reference generation scripts
+include/gcrank/       public headers (error, format, gc_rank, manifest)
+include/gcrank/detail internal headers (installed only in the source tree)
+src/                  library implementation
+cli/                  gcrank-build, gcrank-query
+tests/                doctest suite, fixtures, golden index, consumer test
+data-raw/             fixture/reference generation scripts and the spec checker
 ```
 
 MIT license — see `LICENSE`.
