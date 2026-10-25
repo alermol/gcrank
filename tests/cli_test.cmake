@@ -62,7 +62,7 @@ expect_matches(help "--overwrite")
 
 run_cli(version --version)
 expect_code(version 0)
-expect_matches(version "gcrank-build 0.2.0")
+expect_matches(version "gcrank-build 0.3.1")
 
 run_cli(noargs)
 expect_code(noargs 1)
@@ -270,7 +270,7 @@ expect_code(missing 2)
 
 run_query(qversion --version)
 expect_code(qversion 0)
-expect_matches(qversion "gcrank-query 0.2.0")
+expect_matches(qversion "gcrank-query 0.3.1")
 
 file(REMOVE_RECURSE "${TMP}")
 message(STATUS "gcrank-query CLI test passed")

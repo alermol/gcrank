@@ -10,6 +10,7 @@
 // on a machine that supports the extension.
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__)) && \
     !defined(GCRANK_DISABLE_SHA_NI)
+#include <cpuid.h>
 #include <immintrin.h>
 #define GCRANK_HAVE_SHA_NI 1
 #endif
@@ -179,10 +180,26 @@ __attribute__((target("sha,sse4.1,ssse3"))) void transform_sha_ni(uint32_t state
 
 using TransformFn = void (*)(uint32_t*, const uint8_t*);
 
+// CPUID, rather than __builtin_cpu_supports: Clang 18 and earlier do not accept
+// any feature string for SHA, while the CPUID bits are the same everywhere.
+// SHA-NI implies SSE4.1, but check the prerequisites explicitly before using
+// the target("sha,sse4.1,ssse3") function.
+bool sha_ni_available() {
+  unsigned eax = 0;
+  unsigned ebx = 0;
+  unsigned ecx = 0;
+  unsigned edx = 0;
+  if (__get_cpuid(1, &eax, &ebx, &ecx, &edx) == 0) return false;
+  constexpr unsigned kSsse3 = 1u << 9;
+  constexpr unsigned kSse41 = 1u << 19;
+  if ((ecx & (kSsse3 | kSse41)) != (kSsse3 | kSse41)) return false;
+  if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) == 0) return false;
+  constexpr unsigned kSha = 1u << 29;
+  return (ebx & kSha) != 0;
+}
+
 TransformFn select_transform() {
-  __builtin_cpu_init();
-  if (__builtin_cpu_supports("sha")) return transform_sha_ni;
-  return transform_scalar;
+  return sha_ni_available() ? transform_sha_ni : transform_scalar;
 }
 #else
 using TransformFn = void (*)(uint32_t*, const uint8_t*);
