@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
-#include <vector>
 
 #include "gcrank/error.h"
 #include "gcrank/gc_rank.h"

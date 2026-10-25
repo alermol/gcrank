@@ -16,3 +16,8 @@ cmake-build-*/
 *.so
 *.dylib
 *.exe
+
+# graphify generated artifacts and local tooling
+graphify-out/
+.graphifyignore
+scripts/

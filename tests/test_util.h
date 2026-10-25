@@ -362,11 +362,6 @@ inline std::vector<ExpectedTotals> load_expected_totals(
   return rows;
 }
 
-inline bool close_enough(double a, double b) {
-  const double tolerance = 1e-12 * std::max({1.0, std::fabs(a), std::fabs(b)});
-  return std::fabs(a - b) <= tolerance;
-}
-
 // The GC fraction gcrank reports for a window with these counts: the counts are
 // converted to float and divided in single precision, exactly like
 // `bedtools nuc`'s pct_gc. Used for exact (bit-for-bit) comparisons in tests.

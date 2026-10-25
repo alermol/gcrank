@@ -1,7 +1,6 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdio>
-#include <filesystem>
 #include <format>
 #include <fstream>
 #include <iostream>
