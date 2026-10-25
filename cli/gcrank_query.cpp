@@ -1,7 +1,6 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdio>
-#include <format>
 #include <fstream>
 #include <iostream>
 #include <mutex>
@@ -135,40 +134,67 @@ Options parse_args(int argc, char** argv) {
   return options;
 }
 
-void write_row(std::FILE* out, std::string_view chrom, uint64_t start, uint64_t end,
-               const char* percent, uint64_t gc, uint64_t valid) {
-  const std::string line =
-      std::format("{}\t{}\t{}\t{}\t{}\t{}\t{}\n", chrom, start, end, percent, gc, valid,
-                  end - start);
-  if (std::fwrite(line.data(), 1, line.size(), out) != line.size())
-    throw gcrank::OutputError("write error on stdout");
-}
+// Formats one output row into a reused buffer. std::format allocates and is
+// several times slower per row; the query throughput is dominated by rows at
+// typical window sizes, so every field goes through to_chars. Fixed-point
+// to_chars is both faster than printf and prints the same six digits.
+class RowWriter {
+public:
+  explicit RowWriter(std::FILE* out) : out_(out) { line_.reserve(160); }
 
-// GC fraction as a string, or "nan" where the library would reject the window
-// (zero length, or no A/C/G/T base with remove_ambiguous).
-std::string percent_of(const gcrank::GcRank& index, const gcrank::ContigInfo& contig,
-                       uint64_t start, uint64_t end, uint64_t valid, bool remove_ambiguous) {
-  if (end == start) return "nan";
-  if (remove_ambiguous && valid == 0) return "nan";
-  return std::format("{:.6f}",
-                     index.gc_fraction(contig.name, start, end, remove_ambiguous));
-}
+  void write(std::string_view chrom, uint64_t start, uint64_t end,
+             const gcrank::WindowStats& stats) {
+    line_.clear();
+    line_.append(chrom.data(), chrom.size());
+    line_.push_back('\t');
+    append_uint(start);
+    line_.push_back('\t');
+    append_uint(end);
+    line_.push_back('\t');
+    char percent[32];
+    const auto formatted = std::to_chars(percent, percent + sizeof percent, stats.gc_fraction,
+                                         std::chars_format::fixed, 6);
+    if (formatted.ec != std::errc{})
+      throw gcrank::OutputError("cannot format the GC fraction");
+    line_.append(percent, static_cast<std::size_t>(formatted.ptr - percent));
+    line_.push_back('\t');
+    append_uint(stats.gc);
+    line_.push_back('\t');
+    append_uint(stats.valid);
+    line_.push_back('\t');
+    append_uint(stats.length);
+    line_.push_back('\n');
+    if (std::fwrite(line_.data(), 1, line_.size(), out_) != line_.size())
+      throw gcrank::OutputError("write error on stdout");
+  }
 
-void query_interval(const gcrank::GcRank& index, std::FILE* out, const std::string& chrom,
+private:
+  void append_uint(uint64_t value) {
+    char buffer[20];  // enough for the largest uint64, without a terminator
+    const auto result = std::to_chars(buffer, buffer + sizeof buffer, value);
+    line_.append(buffer, static_cast<std::size_t>(result.ptr - buffer));
+  }
+
+  std::FILE* out_;
+  std::string line_;
+};
+
+void query_interval(const gcrank::GcRank& index, RowWriter& writer, std::string_view chrom,
                     uint64_t start, uint64_t end, uint64_t line_number, bool remove_ambiguous) {
   const gcrank::ContigInfo* contig = index.contig(chrom);
   if (contig == nullptr)
     throw gcrank::InputError("line " + std::to_string(line_number) + ": unknown contig '" +
-                             chrom + "'");
+                             std::string(chrom) + "'");
   if (start > end || end > contig->length)
     throw gcrank::InputError("line " + std::to_string(line_number) + ": window [" +
                              std::to_string(start) + ", " + std::to_string(end) +
-                             ") leaves contig '" + chrom + "' (length " +
+                             ") leaves contig '" + std::string(chrom) + "' (length " +
                              std::to_string(contig->length) + ")");
-  const uint64_t gc = index.gc_count(chrom, start, end);
-  const uint64_t valid = index.valid_count(chrom, start, end);
-  const std::string percent = percent_of(index, *contig, start, end, valid, remove_ambiguous);
-  write_row(out, chrom, start, end, percent.c_str(), gc, valid);
+  // The contig has already been resolved and validated, so use global
+  // coordinates: one rank pass per bitvector, and no second hash lookup.
+  const gcrank::WindowStats stats =
+      index.stats(contig->offset + start, contig->offset + end, remove_ambiguous);
+  writer.write(chrom, start, end, stats);
 }
 
 bool is_skippable(std::string_view line) {
@@ -177,7 +203,7 @@ bool is_skippable(std::string_view line) {
          line.starts_with("browser");
 }
 
-void query_bed(const gcrank::GcRank& index, std::istream& in, std::FILE* out,
+void query_bed(const gcrank::GcRank& index, std::istream& in, RowWriter& writer,
                bool remove_ambiguous) {
   std::string line;
   uint64_t line_number = 0;
@@ -215,21 +241,19 @@ void query_bed(const gcrank::GcRank& index, std::istream& in, std::FILE* out,
     };
     const uint64_t start = field_number(start_text, "start");
     const uint64_t end = field_number(end_text, "end");
-    query_interval(index, out, std::string(chrom), start, end, line_number, remove_ambiguous);
+    query_interval(index, writer, chrom, start, end, line_number, remove_ambiguous);
   }
   if (in.bad()) throw gcrank::InputError("read error on the BED input");
 }
 
-void query_tiling(const gcrank::GcRank& index, uint64_t window, uint64_t step, std::FILE* out,
+void query_tiling(const gcrank::GcRank& index, uint64_t window, uint64_t step, RowWriter& writer,
                   bool remove_ambiguous) {
   for (const gcrank::ContigInfo& contig : index.contigs()) {
     for (uint64_t start = 0; start < contig.length; start += step) {
       const uint64_t end = std::min(start + window, contig.length);
-      const uint64_t gc = index.gc_count(contig.name, start, end);
-      const uint64_t valid = index.valid_count(contig.name, start, end);
-      const std::string percent =
-          percent_of(index, contig, start, end, valid, remove_ambiguous);
-      write_row(out, contig.name, start, end, percent.c_str(), gc, valid);
+      const gcrank::WindowStats stats =
+          index.stats(contig.offset + start, contig.offset + end, remove_ambiguous);
+      writer.write(contig.name, start, end, stats);
     }
   }
 }
@@ -271,9 +295,13 @@ int main(int argc, char** argv) {
     index.load(options.index, open);
 
     std::FILE* out = stdout;
+    // One large stdio buffer keeps one-row-at-a-time fwrite() from turning
+    // into a syscall every few rows.
+    (void)std::setvbuf(out, nullptr, _IOFBF, 1u << 20);
     if (std::fputs("#chrom\tstart\tend\tpct_gc\tnum_gc\tnum_valid\tseq_len\n", out) < 0)
       throw gcrank::OutputError("write error on stdout");
 
+    RowWriter writer(out);
     if (!options.bed.empty()) {
       std::ifstream file;
       std::istream* in = &std::cin;
@@ -282,10 +310,10 @@ int main(int argc, char** argv) {
         if (!file) throw gcrank::InputError("cannot open '" + options.bed + "' for reading");
         in = &file;
       }
-      query_bed(index, *in, out, options.remove_ambiguous);
+      query_bed(index, *in, writer, options.remove_ambiguous);
     } else {
       const uint64_t step = options.step == 0 ? options.window : options.step;
-      query_tiling(index, options.window, step, out, options.remove_ambiguous);
+      query_tiling(index, options.window, step, writer, options.remove_ambiguous);
     }
     if (std::fflush(out) != 0) throw gcrank::OutputError("write error on stdout");
     return 0;

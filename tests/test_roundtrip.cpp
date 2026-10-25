@@ -1,6 +1,7 @@
 #include <doctest.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -45,17 +46,31 @@ void check_against_reference(const GcRank& index, const gctest::NaiveFasta& refe
     CAPTURE(row.label);
     CHECK(index.gc_count(row.start, row.end) == row.gc_count);
     CHECK(index.valid_count(row.start, row.end) == row.valid_count);
+    const WindowStats stats = index.stats(row.start, row.end, false);
+    CHECK(stats.length == row.length());
+    CHECK(stats.gc == row.gc_count);
+    CHECK(stats.valid == row.valid_count);
     if (row.gc_fraction == "ERR") {
       CHECK_THROWS_AS((void)index.gc_fraction(row.start, row.end, false), QueryError);
+      CHECK(std::isnan(stats.gc_fraction));
     } else {
       // Bit-for-bit against the single-precision value implied by the counts.
       CHECK(index.gc_fraction(row.start, row.end, false) ==
             gctest::expect_single(row.gc_count, row.length()));
+      CHECK(stats.gc_fraction ==
+            gctest::expect_single(row.gc_count, row.length()));
     }
+    const WindowStats ambiguous = index.stats(row.start, row.end, true);
+    CHECK(ambiguous.length == stats.length);
+    CHECK(ambiguous.gc == stats.gc);
+    CHECK(ambiguous.valid == stats.valid);
     if (row.gc_fraction_remove_ambiguous == "ERR") {
       CHECK_THROWS_AS((void)index.gc_fraction(row.start, row.end, true), QueryError);
+      CHECK(std::isnan(ambiguous.gc_fraction));
     } else {
       CHECK(index.gc_fraction(row.start, row.end, true) ==
+            gctest::expect_single(row.gc_count, row.valid_count));
+      CHECK(ambiguous.gc_fraction ==
             gctest::expect_single(row.gc_count, row.valid_count));
     }
   }
@@ -73,11 +88,53 @@ void check_against_reference(const GcRank& index, const gctest::NaiveFasta& refe
     const uint64_t end = std::max(a, b);
     CHECK(index.gc_count(start, end) == gctest::naive_gc_count(reference, start, end));
     CHECK(index.valid_count(start, end) == gctest::naive_valid_count(reference, start, end));
+    const WindowStats stats = index.stats(start, end, false);
+    CHECK(stats.length == end - start);
+    CHECK(stats.gc == gctest::naive_gc_count(reference, start, end));
+    CHECK(stats.valid == gctest::naive_valid_count(reference, start, end));
     if (end > start) {
       CHECK(index.gc_fraction(start, end, false) ==
             gctest::expect_single(gctest::naive_gc_count(reference, start, end), end - start));
+      CHECK(stats.gc_fraction ==
+            gctest::expect_single(gctest::naive_gc_count(reference, start, end), end - start));
     }
   }
+}
+
+TEST_CASE("roundtrip: stats matches the individual queries on every contig") {
+  GcRank index;
+  index.load(gctest::data_file("test_small.gcrank").string());
+
+  for (const ContigInfo& contig : index.contigs()) {
+    CAPTURE(contig.name);
+    for (uint64_t start = 0; start <= contig.length; start += 97) {
+      const uint64_t end = std::min(contig.length, start + 211);
+      const WindowStats stats = index.stats(contig.name, start, end, false);
+      CHECK(stats.length == end - start);
+      CHECK(stats.gc == index.gc_count(contig.name, start, end));
+      CHECK(stats.valid == index.valid_count(contig.name, start, end));
+      if (end > start) {
+        CHECK(stats.gc_fraction ==
+              index.gc_fraction(contig.name, start, end, false));
+      } else {
+        CHECK(std::isnan(stats.gc_fraction));
+      }
+
+      const WindowStats ambiguous = index.stats(contig.name, start, end, true);
+      CHECK(ambiguous.length == stats.length);
+      CHECK(ambiguous.gc == stats.gc);
+      CHECK(ambiguous.valid == stats.valid);
+      if (end > start && ambiguous.valid > 0) {
+        CHECK(ambiguous.gc_fraction ==
+              index.gc_fraction(contig.name, start, end, true));
+      } else {
+        CHECK(std::isnan(ambiguous.gc_fraction));
+      }
+    }
+  }
+
+  CHECK_THROWS_AS((void)index.stats("missing", 0, 1), QueryError);
+  CHECK_THROWS_AS((void)index.stats(0, index.total_bases() + 1), QueryError);
 }
 
 }  // namespace

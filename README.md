@@ -145,12 +145,16 @@ returns the neighbouring contig's answer.
 | `gc_fraction(s, e, false)` | `GC / (e - s)` — the `bedtools nuc` convention |
 | `gc_fraction(s, e, true)` | `GC / valid_count` — ambiguous bases removed |
 | `gc_count("chr1", s, e)` | the same, relative to the contig start |
+| `stats("chr1", s, e, rm)` | `{length, gc, valid, gc_fraction}` in one pass |
 
 `gc_fraction` converts the integer counts to `float` and divides in single
 precision exactly like `bedtools nuc`, so `"%.6f"` output is bit-identical to
 its `pct_gc` column; `gc_count` and `valid_count` stay exact integers.
 `gc_fraction(..., true)` throws `QueryError` when the window holds no `A/C/G/T`
-base, and zero-length windows are rejected either way. All errors derive from
+base, and zero-length windows are rejected either way. `stats()` is the
+efficient choice when several columns are needed: it resolves the contig once,
+reads each rank index once, and reports an undefined fraction as NaN instead
+of throwing. All errors derive from
 `gcrank::Error` (`InputError`, `OutputError`, `FormatError`, `QueryError`,
 `UsageError`, `IoError`).
 
@@ -261,19 +265,22 @@ bool ok = (num_g + num_c == index.gc_count(chrom, start, end)) &&
   field; use the same path when comparing. The manifest's `created` field is
   the only wall-clock read in the build path; enforced by `test_parallel.cpp`.
 * Build peak memory ≈ `1.25 * chunk_bits * (threads + 2)` bytes, plus
-  `2 * N/8` for the finished bitvectors and 4.7% of that for the rank indices.
-  The default chunk is 16 M bases, so a 300 Mb genome builds in about 190 MB
-  of RSS regardless of thread count — and regardless of whether the FASTA is
-  wrapped at 60 columns or one single line per contig, because sequence lines
-  are never materialised (measured at 305 MB, Release: ~5.5 s for 1 or 4
-  threads; the parse and hash pass is serial, so extra workers mainly overlap
-  packing).
-* Queries are rank arithmetic and independent of the window length: on the
-  same 300 Mb index, a random window costs ~0.4 µs per count (~0.7 µs for
-  `gc_count` + `valid_count`) and a whole-genome query ~50 ns. Loading with
-  `mmap = true` (`validate_crc = false`) maps the index instead of reading it;
-  a tiling query of 300,000 windows over that index takes ~0.6 s end to end,
-  most of it formatting the output rows.
+  `2 * N/8` for the finished bitvectors, 4.7% of that for the rank indices,
+  and about 1 MB of hashing buffers. The default chunk is 16 M bases, so a
+  300 Mb genome builds in about 190 MB of RSS regardless of thread count — and
+  regardless of whether the FASTA is wrapped at 60 columns or one single line
+  per contig, because sequence lines are never materialised.
+* Hashing is not on the critical path: the SHA-256 helper thread consumes the
+  parser's read buffers while the parallel workers pack blocks. SHA-NI is used
+  when available (runtime detected, scalar fallback elsewhere). On a 160 Mbp
+  60-column FASTA with an AMD EPYC 7742, a Release build takes ~0.8 s end to
+  end for 1–8 threads; the remaining limit is the serial FASTA parse.
+* Queries are rank arithmetic and independent of the window length: on that
+  160 Mbp index, a random window costs ~0.3 µs per count (~0.65 µs for a full
+  `stats()` row: `gc`, `valid`, `length` and the fraction) and a whole-genome
+  query ~50 ns. Loading with `mmap = true` (`validate_crc = false`) maps the
+  index instead of reading it; a 160,000-window tiling query takes ~0.19 s end
+  to end, and 200,000 BED windows take ~0.32 s, including formatting.
 
 ## Testing
 
